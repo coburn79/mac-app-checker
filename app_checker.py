@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -202,83 +202,89 @@ def _quit_app(name):
                    capture_output=True, timeout=5)
     time.sleep(1)
 
-def _install_dmg(url, app_name):
-    print(f"  Downloading {app_name}...", flush=True)
-    with tempfile.NamedTemporaryFile(suffix='.dmg', delete=False) as f:
-        tmp = f.name
-    try:
-        r = subprocess.run(['curl', '-L', '--progress-bar', '-o', tmp, url], timeout=600)
+def _ditto_install(src_app, app_name):
+    """Copy src_app into /Applications using ditto (preserves macOS metadata)."""
+    dest = f'/Applications/{os.path.basename(src_app)}'
+    _quit_app(app_name)
+    if os.path.exists(dest):
+        r = subprocess.run(['rm', '-rf', dest], capture_output=True)
         if r.returncode != 0:
-            print(GRY("  Download failed.")); return False
-        print("  Mounting disk image...", flush=True)
-        mr = subprocess.run(['hdiutil', 'attach', '-nobrowse', '-noverify', tmp],
-                            capture_output=True, text=True)
-        if mr.returncode != 0:
-            print(GRY("  Mount failed.")); return False
-        mount_point = next(
-            ('/Volumes/' + line.split('/Volumes/', 1)[1].strip()
-             for line in mr.stdout.split('\n') if '/Volumes/' in line),
-            None
-        )
-        if not mount_point:
-            print(GRY("  Could not find mount point.")); return False
-        try:
-            app_in_dmg = next(
-                (os.path.join(mount_point, e) for e in os.listdir(mount_point) if e.endswith('.app')),
+            return False, 'Permission denied removing old version'
+    r = subprocess.run(['ditto', src_app, dest], capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, r.stderr.strip() or 'Install failed (permission denied?)'
+    subprocess.run(['xattr', '-cr', dest], capture_output=True)
+    return True, f'Installed {os.path.basename(src_app)}'
+
+def _install_from_url(url, app_name):
+    """Download url, detect DMG or ZIP, install the .app. Returns (success, message)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        dl = os.path.join(tmp_dir, 'download')
+        safe_print(f"  Downloading {app_name}...")
+        r = subprocess.run(['curl', '-L', '-s', '-o', dl, url], timeout=600)
+        if r.returncode != 0 or not os.path.exists(dl):
+            return False, 'Download failed'
+
+        # Detect file type from magic bytes (not URL extension)
+        ft = subprocess.run(['file', dl], capture_output=True, text=True).stdout.lower()
+        is_dmg = any(k in ft for k in ('apple disk image', 'udif', 'binhex'))
+        is_zip = any(k in ft for k in ('zip archive', 'jar'))
+
+        if not is_dmg and not is_zip:
+            # Fallback: check URL for hints
+            u = url.lower().split('?')[0]
+            is_dmg = u.endswith('.dmg')
+            is_zip = u.endswith('.zip')
+
+        if is_dmg:
+            safe_print(f"  Mounting disk image...")
+            mr = subprocess.run(
+                ['hdiutil', 'attach', '-nobrowse', '-noverify', dl],
+                capture_output=True, text=True
+            )
+            if mr.returncode != 0:
+                return False, 'Could not mount disk image'
+            mount_point = next(
+                ('/Volumes/' + line.split('/Volumes/', 1)[1].strip()
+                 for line in mr.stdout.split('\n') if '/Volumes/' in line),
                 None
             )
-            if not app_in_dmg:
-                print(GRY("  No .app found in DMG.")); return False
-            dest = f'/Applications/{os.path.basename(app_in_dmg)}'
-            print(f"  Installing {os.path.basename(app_in_dmg)}...", flush=True)
-            _quit_app(app_name)
-            if os.path.exists(dest):
-                try:
-                    shutil.rmtree(dest)
-                except PermissionError:
-                    print(GRY("  Permission denied — try: sudo python3 app_checker.py --gui"))
-                    return False
-            shutil.copytree(app_in_dmg, dest, symlinks=True)
-            print(GRN(f"  ✓ Installed to {dest}"))
-            return True
-        finally:
-            subprocess.run(['hdiutil', 'detach', mount_point, '-quiet'], capture_output=True)
-    except Exception as e:
-        print(GRY(f"  Error: {e}")); return False
-    finally:
-        try: os.unlink(tmp)
-        except: pass
-
-def _install_zip(url, app_name):
-    print(f"  Downloading {app_name}...", flush=True)
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        zip_path = os.path.join(tmp_dir, 'app.zip')
-        r = subprocess.run(['curl', '-L', '--progress-bar', '-o', zip_path, url], timeout=600)
-        if r.returncode != 0:
-            print(GRY("  Download failed.")); return False
-        extract_dir = os.path.join(tmp_dir, 'extracted')
-        os.makedirs(extract_dir)
-        subprocess.run(['unzip', '-q', zip_path, '-d', extract_dir])
-        app_in_zip = None
-        for root, dirs, _ in os.walk(extract_dir):
-            for d in dirs:
-                if d.endswith('.app'):
-                    app_in_zip = os.path.join(root, d); break
-            if app_in_zip: break
-        if not app_in_zip:
-            print(GRY("  No .app found in ZIP.")); return False
-        dest = f'/Applications/{os.path.basename(app_in_zip)}'
-        print(f"  Installing {os.path.basename(app_in_zip)}...", flush=True)
-        _quit_app(app_name)
-        if os.path.exists(dest):
+            if not mount_point:
+                return False, 'Could not find mount point'
             try:
-                shutil.rmtree(dest)
-            except PermissionError:
-                print(GRY("  Permission denied — try: sudo python3 app_checker.py --gui"))
-                return False
-        shutil.copytree(app_in_zip, dest, symlinks=True)
-        print(GRN(f"  ✓ Installed to {dest}"))
-        return True
+                app_src = next(
+                    (os.path.join(mount_point, e)
+                     for e in os.listdir(mount_point) if e.endswith('.app')),
+                    None
+                )
+                if not app_src:
+                    return False, 'No .app found in disk image'
+                safe_print(f"  Installing {os.path.basename(app_src)}...")
+                return _ditto_install(app_src, app_name)
+            except Exception as e:
+                return False, str(e)
+            finally:
+                subprocess.run(['hdiutil', 'detach', mount_point, '-quiet'],
+                               capture_output=True)
+
+        elif is_zip:
+            extract_dir = os.path.join(tmp_dir, 'x')
+            os.makedirs(extract_dir)
+            subprocess.run(['unzip', '-q', dl, '-d', extract_dir], capture_output=True)
+            app_src = None
+            for root, dirs, _ in os.walk(extract_dir):
+                for d in dirs:
+                    if d.endswith('.app'):
+                        app_src = os.path.join(root, d); break
+                if app_src:
+                    break
+            if not app_src:
+                return False, 'No .app found in ZIP'
+            safe_print(f"  Installing {os.path.basename(app_src)}...")
+            return _ditto_install(app_src, app_name)
+
+        else:
+            return False, 'Unknown file format (not DMG or ZIP)'
 
 def do_update(app):
     """Trigger an update for the app. Returns (success, message)."""
@@ -305,25 +311,20 @@ def do_update(app):
         subprocess.run(['open', '-a', app['name']])
         return True, 'App opened — check for updates inside the app'
 
-    safe_print(f"  Fetching download link for {app['name']}...", flush=True)
+    safe_print(f"  Fetching download info for {app['name']}...", flush=True)
     cask = fetch_cask(token)
     if not cask:
         return False, 'Could not fetch download info'
 
-    url      = cask.get('url', '')
-    homepage = cask.get('homepage', '')
+    url = cask.get('url', '')
+    if not url:
+        homepage = cask.get('homepage', '')
+        if homepage:
+            subprocess.run(['open', homepage])
+            return True, 'Download page opened'
+        return False, 'No download URL found'
 
-    # Open the download URL or homepage in browser — let the user install it
-    # (auto-installing to /Applications requires elevated permissions and
-    #  can crash if the app is running or permissions are restricted)
-    target = url or homepage
-    if target:
-        safe_print(f"  Opening download page for {app['name']}...")
-        subprocess.run(['open', target])
-        return True, 'Download page opened — install and replace the app when done'
-    else:
-        subprocess.run(['open', '-a', app['name']])
-        return True, 'App opened'
+    return _install_from_url(url, app['name'])
 
 # ── HTML dashboard ────────────────────────────────────────────────────────────
 HTML_TEMPLATE = r"""<!doctype html>
@@ -479,8 +480,8 @@ async function doUpdate(btn,enc){
   try{
     const r=await fetch('/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
     const d=await r.json();
-    if(d.success){btn.textContent='✓ Done';btn.classList.add('ok')}
-    else{btn.textContent='✗ Failed';btn.classList.add('err');btn.disabled=false}
+    if(d.success){btn.textContent='✓ Done';btn.title=d.msg||'';btn.classList.add('ok')}
+    else{btn.textContent='✗ Failed';btn.title=d.msg||'';btn.classList.add('err');btn.disabled=false}
   }catch(e){btn.textContent='✗ Error';btn.classList.add('err');btn.disabled=false}
 }
 
