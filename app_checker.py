@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading
 
-# ── Colour helpers ────────────────────────────────────────────────────────────
+# ── Colour helpers (terminal mode only) ──────────────────────────────────────
 USE_COLOR = sys.stdout.isatty()
 def _c(code, t): return f"\033[{code}m{t}\033[0m" if USE_COLOR else t
 RED = lambda t: _c("91", t)
@@ -36,6 +36,14 @@ CASK_OVERRIDES = {
     'nova': 'nova', 'nordvpn': 'nordvpn', 'expressvpn': 'expressvpn',
     'handbrake': 'handbrake', 'imageoptim': 'imageoptim',
 }
+
+# Microsoft Office apps use AutoUpdate, not Homebrew Cask downloads
+MICROSOFT_CASKS = {
+    'microsoft-word', 'microsoft-excel', 'microsoft-powerpoint',
+    'microsoft-onenote', 'microsoft-outlook', 'microsoft-teams',
+    'microsoft-edge',
+}
+MICROSOFT_AUTOUPDATE = '/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app'
 
 # ── Network ───────────────────────────────────────────────────────────────────
 def fetch_url(url, timeout=10):
@@ -165,7 +173,7 @@ def _quit_app(name):
     time.sleep(1)
 
 def _install_dmg(url, app_name):
-    print("  Downloading...", flush=True)
+    print(f"  Downloading {app_name}...", flush=True)
     with tempfile.NamedTemporaryFile(suffix='.dmg', delete=False) as f:
         tmp = f.name
     try:
@@ -198,7 +206,7 @@ def _install_dmg(url, app_name):
                 try:
                     shutil.rmtree(dest)
                 except PermissionError:
-                    print(GRY("  Permission denied — try: sudo python3 app_checker.py"))
+                    print(GRY("  Permission denied — try: sudo python3 app_checker.py --gui"))
                     return False
             shutil.copytree(app_in_dmg, dest, symlinks=True)
             print(GRN(f"  ✓ Installed to {dest}"))
@@ -212,7 +220,7 @@ def _install_dmg(url, app_name):
         except: pass
 
 def _install_zip(url, app_name):
-    print("  Downloading...", flush=True)
+    print(f"  Downloading {app_name}...", flush=True)
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = os.path.join(tmp_dir, 'app.zip')
         r = subprocess.run(['curl', '-L', '--progress-bar', '-o', zip_path, url], timeout=600)
@@ -236,50 +244,294 @@ def _install_zip(url, app_name):
             try:
                 shutil.rmtree(dest)
             except PermissionError:
-                print(GRY("  Permission denied — try: sudo python3 app_checker.py"))
+                print(GRY("  Permission denied — try: sudo python3 app_checker.py --gui"))
                 return False
         shutil.copytree(app_in_zip, dest, symlinks=True)
         print(GRN(f"  ✓ Installed to {dest}"))
         return True
 
 def do_update(app):
-    """Update a single app — dispatches by source type."""
-    if app['source'] == 'App Store':
-        print("  Opening App Store updates page...")
-        subprocess.run(['open', 'macappstore://showUpdatesPage'])
-        return True
+    """Update a single app. Returns (success, opened_store)."""
+    token = app.get('cask_token', '')
 
-    token = app.get('cask_token')
+    # Microsoft Office → AutoUpdate tool
+    if token in MICROSOFT_CASKS:
+        if os.path.exists(MICROSOFT_AUTOUPDATE):
+            print(f"  Opening Microsoft AutoUpdate...")
+            subprocess.run(['open', MICROSOFT_AUTOUPDATE])
+            return True, False
+        # Fall through to App Store check or open the app
+        print(f"  Opening {app['name']} to check for updates...")
+        subprocess.run(['open', '-a', app['name']])
+        return True, False
+
+    if app['source'] == 'App Store':
+        print(f"  Opening App Store updates page...")
+        subprocess.run(['open', 'macappstore://showUpdatesPage'])
+        return True, True
+
     if not token:
         print(f"  Launching {app['name']} to trigger its built-in updater...")
         subprocess.run(['open', '-a', app['name']])
-        return True
+        return True, False
 
-    print("  Fetching download info...", flush=True)
+    print(f"  Fetching download info for {app['name']}...", flush=True)
     cask = fetch_cask(token)
     if not cask:
-        print(GRY("  Could not get download info.")); return False
+        print(GRY("  Could not get download info.")); return False, False
 
     url      = cask.get('url', '')
     homepage = cask.get('homepage', '')
     ext      = url.lower().split('?')[0].split('#')[0]
 
     if ext.endswith('.dmg'):
-        return _install_dmg(url, app['name'])
+        return _install_dmg(url, app['name']), False
     elif ext.endswith('.zip'):
-        return _install_zip(url, app['name'])
-    elif ext.endswith('.pkg'):
-        print("  PKG installer — opening download page in browser...")
-        subprocess.run(['open', homepage or url])
-        return False
+        return _install_zip(url, app['name']), False
     else:
-        target = homepage or url
-        if target:
-            print(f"  Opening download page for {app['name']}...")
-            subprocess.run(['open', target])
+        # PKG or unknown — open the app itself or its homepage, never Safari silently
+        print(f"  This app requires a manual update.")
+        if homepage:
+            print(f"  Opening homepage: {homepage}")
+            subprocess.run(['open', homepage])
         else:
             subprocess.run(['open', '-a', app['name']])
-        return False
+        return False, False
+
+# ── HTML dashboard ────────────────────────────────────────────────────────────
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mac App Checker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Serif+Text&family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f7f5f2;--bg2:#edeae6;--bg3:#fff;
+  --fg:#1c1917;--fg2:#6b7280;--border:#e2ddd8;
+  --accent:#2563eb;
+  --upd:#b45309;--upd-bg:#fef3c7;
+  --ok:#15803d;--ok-bg:#f0fdf4;
+  --crit:#b91c1c;--crit-bg:#fff1f1;
+  --unk:#64748b;--unk-bg:#f1f5f9;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg:#111318;--bg2:#1c2030;--bg3:#1c2030;
+    --fg:#e9ecef;--fg2:#7a8899;--border:#2a3245;
+    --accent:#60a5fa;
+    --upd:#fbbf24;--upd-bg:#2c1900;
+    --ok:#34d399;--ok-bg:#052e16;
+    --crit:#f87171;--crit-bg:#2d0808;
+    --unk:#64748b;--unk-bg:#1c2030;
+  }
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'DM Sans',system-ui,sans-serif;background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5;padding:32px 24px;max-width:940px;margin:0 auto}
+h1{font-family:'DM Serif Text',serif;font-size:30px;font-weight:400;margin-bottom:4px;letter-spacing:-.01em}
+.sub{color:var(--fg2);font-size:13px;margin-bottom:20px}
+.macos-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:20px;font-size:13px}
+.macos-label{color:var(--fg2);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:24px}
+@media(max-width:520px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:14px 16px;cursor:pointer;transition:border-color .15s}
+.stat:hover,.stat.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.stat-num{font-family:'JetBrains Mono',monospace;font-size:26px;font-weight:500;line-height:1;margin-bottom:5px;font-variant-numeric:tabular-nums}
+.stat-label{font-size:11px;color:var(--fg2);text-transform:uppercase;letter-spacing:.06em}
+.stat-all .stat-num{color:var(--fg)}
+.stat-upd .stat-num{color:var(--upd)}
+.stat-ok  .stat-num{color:var(--ok)}
+.stat-unk .stat-num{color:var(--unk)}
+.toolbar{display:flex;justify-content:flex-end;margin-bottom:12px}
+.btn-all{padding:8px 18px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.btn-all:hover{opacity:.85}
+.btn-all:disabled{opacity:.5;cursor:default}
+.shell{background:var(--bg3);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead{background:var(--bg2)}
+th{text-align:left;padding:10px 16px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg2);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:11px 16px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--bg2)}
+.app-name{font-weight:500}
+.ver{font-family:'JetBrains Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums;color:var(--fg2)}
+.ver.i{color:var(--fg)}
+.arrow{color:var(--fg2);padding:0 4px;font-size:11px}
+.vc{display:flex;align-items:center;flex-wrap:wrap;gap:2px}
+.badge{display:inline-block;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+.b-upd{background:var(--upd-bg);color:var(--upd)}
+.b-crit{background:var(--crit-bg);color:var(--crit)}
+.b-ok{background:var(--ok-bg);color:var(--ok)}
+.b-unk{background:var(--unk-bg);color:var(--unk)}
+.btn-upd{padding:4px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-upd:hover{border-color:var(--accent);color:var(--accent)}
+.btn-upd:disabled{opacity:.5;cursor:default}
+.btn-upd.ok{border-color:var(--ok);color:var(--ok)}
+.btn-upd.err{border-color:var(--crit);color:var(--crit)}
+.empty{text-align:center;padding:48px;color:var(--fg2);font-style:italic}
+@media(max-width:600px){.col-src{display:none}}
+</style>
+</head>
+<body>
+<h1>Mac App Checker</h1>
+<p class="sub" id="sub"></p>
+<div class="macos-bar" id="macos"></div>
+<div class="stats" id="stats"></div>
+<div class="toolbar" id="toolbar" hidden>
+  <button class="btn-all" id="btn-all" onclick="updateAll()">Update All</button>
+</div>
+<div class="shell">
+  <div class="wrap">
+    <table>
+      <thead><tr>
+        <th>App</th><th>Versions</th>
+        <th class="col-src">Source</th>
+        <th>Status</th><th></th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No apps match this filter.</div>
+  </div>
+</div>
+<script>
+const D=__DATA__;
+let f='all';
+const cv=v=>v?v.split(',')[0]:'';
+const BM={update:'b-upd',behind:'b-crit',current:'b-ok',unknown:'b-unk'};
+const BL={update:'Update',behind:'Far behind',current:'Current',unknown:'Unknown'};
+
+function render(){
+  const all=D.apps, upd=all.filter(a=>a.status==='update'||a.status==='behind'),
+        ok=all.filter(a=>a.status==='current'), unk=all.filter(a=>a.status==='unknown');
+  document.getElementById('sub').textContent=
+    `Scanned ${all.length} apps · ${new Date().toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})}`;
+  const m=D.macos||{};
+  document.getElementById('macos').innerHTML=m.has_update
+    ?`<span class="macos-label">macOS</span><b>${m.version}</b><span style="color:var(--upd)">Update available: ${(m.updates||[]).slice(0,2).join(', ')}</span>`
+    :`<span class="macos-label">macOS</span><b>${m.version||'—'}</b><span style="color:var(--ok)">${m.version?'✓ Up to date':'Could not check'}</span>`;
+  const defs=[
+    {k:'all',cls:'stat-all',n:all.length,l:'All apps'},
+    {k:'upd',cls:'stat-upd',n:upd.length,l:'Need updates'},
+    {k:'ok', cls:'stat-ok', n:ok.length, l:'Up to date'},
+    {k:'unk',cls:'stat-unk',n:unk.length,l:'Unknown'},
+  ];
+  document.getElementById('stats').innerHTML=defs.map(d=>
+    `<div class="stat ${d.cls}${d.k===f?' active':''}" onclick="setF('${d.k}')">
+      <div class="stat-num">${d.n}</div><div class="stat-label">${d.l}</div></div>`).join('');
+  document.getElementById('toolbar').hidden=upd.length===0;
+  const fm={all:null,upd:['update','behind'],ok:['current'],unk:['unknown']};
+  const rows=fm[f]?all.filter(a=>fm[f].includes(a.status)):all;
+  document.getElementById('empty').hidden=rows.length>0;
+  document.getElementById('tbody').innerHTML=rows.map(a=>{
+    const v=cv(a.latest)||'';
+    const vc=a.status==='current'||!v
+      ?`<span class="ver i">${a.installed}</span>`
+      :`<span class="ver i">${a.installed}</span><span class="arrow">→</span><span class="ver">${v}</span>`;
+    const id='b-'+a.name.replace(/\s+/g,'-');
+    const btn=(a.status==='update'||a.status==='behind')
+      ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">Update</button>`:'';
+    return `<tr><td><span class="app-name">${a.name}</span></td>
+      <td><div class="vc">${vc}</div></td>
+      <td class="col-src" style="color:var(--fg2);font-size:12px">${a.source}</td>
+      <td><span class="badge ${BM[a.status]}">${BL[a.status]}</span></td>
+      <td>${btn}</td></tr>`;
+  }).join('');
+}
+
+function setF(v){f=v;render()}
+
+async function doUpdate(btn,enc){
+  const name=decodeURIComponent(enc);
+  btn.disabled=true; btn.textContent='Updating…';
+  try{
+    const r=await fetch('/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+    const d=await r.json();
+    if(d.success){btn.textContent=d.opened_store?'App Store ↗':'✓ Done';btn.classList.add('ok')}
+    else{btn.textContent='✗ Manual';btn.classList.add('err');btn.disabled=false}
+  }catch(e){btn.textContent='✗ Error';btn.classList.add('err');btn.disabled=false}
+}
+
+async function updateAll(){
+  const btn=document.getElementById('btn-all');
+  btn.disabled=true; btn.textContent='Updating…';
+  const apps=D.apps.filter(a=>a.status==='update'||a.status==='behind');
+  for(const a of apps){
+    const b=document.getElementById('b-'+a.name.replace(/\s+/g,'-'));
+    if(b&&!b.classList.contains('ok'))await doUpdate(b,encodeURIComponent(a.name));
+  }
+  btn.textContent='Done';
+}
+render();
+</script>
+</body></html>"""
+
+def build_html(results, macos_info):
+    data = json.dumps({'apps': results, 'macos': macos_info})
+    return HTML_TEMPLATE.replace('__DATA__', data)
+
+# ── HTTP dashboard server ─────────────────────────────────────────────────────
+def serve_dashboard(results, macos_info):
+    from http.server import BaseHTTPRequestHandler
+    from socketserver import ThreadingTCPServer
+    import webbrowser, urllib.parse as up
+
+    app_data = {'results': results, 'macos': macos_info}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def do_GET(self):
+            html = build_html(app_data['results'], app_data['macos'])
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(html.encode())
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.end_headers()
+
+        def do_POST(self):
+            if self.path == '/update':
+                length = int(self.headers.get('Content-Length', 0))
+                body   = json.loads(self.rfile.read(length) or b'{}')
+                name   = body.get('name', '')
+                app    = next((a for a in app_data['results'] if a['name'] == name), None)
+                if app:
+                    success, opened_store = do_update(app)
+                    resp = json.dumps({'success': success, 'opened_store': opened_store})
+                else:
+                    resp = json.dumps({'success': False, 'error': 'not found'})
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(resp.encode())
+
+    # Find an open port
+    ThreadingTCPServer.allow_reuse_address = True
+    for port in [8765, 8766, 8767, 8768, 8769]:
+        try:
+            server = ThreadingTCPServer(('localhost', port), H)
+            break
+        except OSError:
+            continue
+
+    print(BLD(f"\nMac App Checker  v{__version__}"))
+    print(GRY(f"Dashboard running at http://localhost:{port}"))
+    print(GRY("Press Ctrl+C to stop.\n"))
+    webbrowser.open(f'http://localhost:{port}')
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    server.shutdown()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 STATUS_LABEL = {
@@ -289,19 +541,12 @@ STATUS_LABEL = {
     'unknown': GRY('Unknown'),
 }
 
-def main():
-    json_mode = '--json' in sys.argv
-
-    if not json_mode:
-        print(BLD(f"\nMac App Checker  v{__version__}"))
-        print(GRY("Checking macOS and scanning /Applications…\n"))
-
-    # Run macOS check concurrently with app scan
+def scan_apps():
+    """Scan apps and check versions. Returns (results, macos_info)."""
     macos_result = {}
     t = threading.Thread(target=lambda: macos_result.update(check_macos()), daemon=True)
     t.start()
 
-    # Scan and check apps
     apps = find_apps()
     results = []
     for app in apps:
@@ -330,17 +575,31 @@ def main():
         })
 
     t.join(timeout=40)
-
     for r in results:
         r['status'] = get_status(r)
 
-    # ── JSON output mode (for dashboard) ─────────────────────────────────────
+    return results, macos_result
+
+def main():
+    json_mode = '--json' in sys.argv
+    gui_mode  = '--gui'  in sys.argv
+
+    if not json_mode:
+        print(BLD(f"\nMac App Checker  v{__version__}"))
+        print(GRY("Checking macOS and scanning /Applications…\n"))
+
+    results, macos_info = scan_apps()
+
     if json_mode:
-        print(json.dumps({'macos': macos_result, 'apps': results}, indent=2))
+        print(json.dumps({'macos': macos_info, 'apps': results}, indent=2))
         return
 
-    # ── macOS status line ─────────────────────────────────────────────────────
-    m = macos_result
+    if gui_mode:
+        serve_dashboard(results, macos_info)
+        return
+
+    # ── Interactive Terminal mode ─────────────────────────────────────────────
+    m = macos_info
     if m.get('has_update'):
         upd_names = ', '.join(m['updates'][:2]) + (' …' if len(m['updates']) > 2 else '')
         print(f"macOS  {YEL(m.get('version','?'))}  {YEL('Update available:')} {upd_names}")
@@ -349,7 +608,6 @@ def main():
     else:
         print(f"macOS  {GRY('Could not check')}")
 
-    # ── App categories ────────────────────────────────────────────────────────
     needs  = [r for r in results if r['status'] in ('update', 'behind')]
     ok     = [r for r in results if r['status'] == 'current']
     unk    = [r for r in results if r['status'] == 'unknown']
@@ -363,7 +621,6 @@ def main():
         print(GRN("All apps are up to date!"))
         return
 
-    # ── Updates table ─────────────────────────────────────────────────────────
     W = 70
     print(BLD("UPDATES AVAILABLE"))
     print(GRY("─" * W))
@@ -371,8 +628,7 @@ def main():
     print(GRY("─" * W))
     for i, app in enumerate(needs, 1):
         cv = clean_ver(app.get('latest', '')) or '—'
-        status = STATUS_LABEL[app['status']]
-        print(f"  {i:<4}{app['name']:<28}{app['installed']:<16}{cv:<16}  {status}")
+        print(f"  {i:<4}{app['name']:<28}{app['installed']:<16}{cv:<16}  {STATUS_LABEL[app['status']]}")
     print(GRY("─" * W))
 
     if ok:
@@ -382,7 +638,6 @@ def main():
         names = ', '.join(r['name'] for r in unk[:5]) + (f' +{len(unk)-5} more' if len(unk) > 5 else '')
         print(f"{GRY('UNKNOWN:')} {GRY(names)}")
 
-    # ── Update prompt ─────────────────────────────────────────────────────────
     print(f"\n{BLD('What would you like to update?')}")
     print(f"  Enter a number {GRY(f'(1–{len(needs)})')}, {YEL('a')} for all, or press {GRY('Enter')} to exit: ", end='', flush=True)
 
