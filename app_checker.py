@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
-import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading
+import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
 # ── Colour helpers (terminal mode only) ──────────────────────────────────────
 USE_COLOR = sys.stdout.isatty()
@@ -13,6 +13,21 @@ YEL = lambda t: _c("93", t)
 GRN = lambda t: _c("92", t)
 GRY = lambda t: _c("90", t)
 BLD = lambda t: _c("1",  t)
+
+def safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except (BrokenPipeError, IOError, OSError):
+        pass
+
+def open_dashboard_browser(url):
+    """Open url in Chrome/Firefox if available (they don't warn about HTTP localhost)."""
+    for name in ['Google Chrome', 'Firefox', 'Arc', 'Brave Browser']:
+        if os.path.exists(f'/Applications/{name}.app'):
+            subprocess.run(['open', '-a', name, url], capture_output=True)
+            return
+    import webbrowser
+    webbrowser.open(url)
 
 # ── Cask name overrides ───────────────────────────────────────────────────────
 CASK_OVERRIDES = {
@@ -257,28 +272,27 @@ def do_update(app):
     # Microsoft Office → AutoUpdate tool
     if token in MICROSOFT_CASKS:
         if os.path.exists(MICROSOFT_AUTOUPDATE):
-            print(f"  Opening Microsoft AutoUpdate...")
+            safe_print(f"  Opening Microsoft AutoUpdate...")
             subprocess.run(['open', MICROSOFT_AUTOUPDATE])
             return True, False
-        # Fall through to App Store check or open the app
-        print(f"  Opening {app['name']} to check for updates...")
+        safe_print(f"  Opening {app['name']} to check for updates...")
         subprocess.run(['open', '-a', app['name']])
         return True, False
 
     if app['source'] == 'App Store':
-        print(f"  Opening App Store updates page...")
+        safe_print(f"  Opening App Store updates page...")
         subprocess.run(['open', 'macappstore://showUpdatesPage'])
         return True, True
 
     if not token:
-        print(f"  Launching {app['name']} to trigger its built-in updater...")
+        safe_print(f"  Launching {app['name']} to trigger its built-in updater...")
         subprocess.run(['open', '-a', app['name']])
         return True, False
 
-    print(f"  Fetching download info for {app['name']}...", flush=True)
+    safe_print(f"  Fetching download info for {app['name']}...", flush=True)
     cask = fetch_cask(token)
     if not cask:
-        print(GRY("  Could not get download info.")); return False, False
+        safe_print(GRY("  Could not get download info.")); return False, False
 
     url      = cask.get('url', '')
     homepage = cask.get('homepage', '')
@@ -289,10 +303,9 @@ def do_update(app):
     elif ext.endswith('.zip'):
         return _install_zip(url, app['name']), False
     else:
-        # PKG or unknown — open the app itself or its homepage, never Safari silently
-        print(f"  This app requires a manual update.")
+        safe_print(f"  This app requires a manual update.")
         if homepage:
-            print(f"  Opening homepage: {homepage}")
+            safe_print(f"  Opening homepage: {homepage}")
             subprocess.run(['open', homepage])
         else:
             subprocess.run(['open', '-a', app['name']])
@@ -348,6 +361,8 @@ h1{font-family:'DM Serif Text',serif;font-size:30px;font-weight:400;margin-botto
 .btn-all{padding:8px 18px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
 .btn-all:hover{opacity:.85}
 .btn-all:disabled{opacity:.5;cursor:default}
+.btn-quit{padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:13px;cursor:pointer;transition:all .15s}
+.btn-quit:hover{border-color:var(--crit);color:var(--crit)}
 .shell{background:var(--bg3);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .wrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -380,8 +395,9 @@ tr:hover td{background:var(--bg2)}
 <p class="sub" id="sub"></p>
 <div class="macos-bar" id="macos"></div>
 <div class="stats" id="stats"></div>
-<div class="toolbar" id="toolbar" hidden>
-  <button class="btn-all" id="btn-all" onclick="updateAll()">Update All</button>
+<div class="toolbar" id="toolbar" style="justify-content:space-between">
+  <button class="btn-quit" onclick="if(confirm('Stop Mac App Checker?'))location.href='/quit'">Quit</button>
+  <button class="btn-all" id="btn-all" onclick="updateAll()" hidden>Update All</button>
 </div>
 <div class="shell">
   <div class="wrap">
@@ -421,7 +437,7 @@ function render(){
   document.getElementById('stats').innerHTML=defs.map(d=>
     `<div class="stat ${d.cls}${d.k===f?' active':''}" onclick="setF('${d.k}')">
       <div class="stat-num">${d.n}</div><div class="stat-label">${d.l}</div></div>`).join('');
-  document.getElementById('toolbar').hidden=upd.length===0;
+  document.getElementById('btn-all').hidden=upd.length===0;
   const fm={all:null,upd:['update','behind'],ok:['current'],unk:['unknown']};
   const rows=fm[f]?all.filter(a=>fm[f].includes(a.status)):all;
   document.getElementById('empty').hidden=rows.length>0;
@@ -476,14 +492,28 @@ def build_html(results, macos_info):
 def serve_dashboard(results, macos_info):
     from http.server import BaseHTTPRequestHandler
     from socketserver import ThreadingTCPServer
-    import webbrowser, urllib.parse as up
 
-    app_data = {'results': results, 'macos': macos_info}
+    # Survive terminal close: ignore SIGHUP so the server keeps running
+    # even after the .app launcher window closes
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (AttributeError, OSError):
+        pass
+
+    app_data = {'results': results, 'macos': macos_info, 'server': None}
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
 
         def do_GET(self):
+            if self.path == '/quit':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(b'<html><body style="font-family:sans-serif;padding:40px"><h2>Mac App Checker stopped.</h2><p>You can close this tab.</p></body></html>')
+                if app_data['server']:
+                    threading.Thread(target=app_data['server'].shutdown, daemon=True).start()
+                return
             html = build_html(app_data['results'], app_data['macos'])
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -516,20 +546,28 @@ def serve_dashboard(results, macos_info):
 
     # Find an open port
     ThreadingTCPServer.allow_reuse_address = True
-    for port in [8765, 8766, 8767, 8768, 8769]:
+    server = None
+    port = 8765
+    for p in [8765, 8766, 8767, 8768, 8769]:
         try:
-            server = ThreadingTCPServer(('localhost', port), H)
+            server = ThreadingTCPServer(('localhost', p), H)
+            port = p
             break
         except OSError:
             continue
 
-    print(BLD(f"\nMac App Checker  v{__version__}"))
-    print(GRY(f"Dashboard running at http://localhost:{port}"))
-    print(GRY("Press Ctrl+C to stop.\n"))
-    webbrowser.open(f'http://localhost:{port}')
+    if server is None:
+        safe_print("Could not bind to any port 8765-8769.")
+        return
+
+    app_data['server'] = server
+    url = f'http://localhost:{port}'
+    safe_print(BLD(f"\nMac App Checker  v{__version__}"))
+    safe_print(GRY(f"Dashboard at {url}  (close the browser tab or visit {url}/quit to stop)"))
+    open_dashboard_browser(url)
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, BrokenPipeError, OSError):
         pass
     server.shutdown()
 
