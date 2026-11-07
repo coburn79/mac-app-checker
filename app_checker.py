@@ -319,7 +319,15 @@ def main():
             else:
                 source = 'Direct'
         time.sleep(0.05)
-        results.append({**app, 'latest': latest or '', 'source': source, 'cask_token': cask_token or ''})
+        results.append({
+            'name':       app['name'],
+            'installed':  app['version'],
+            'bundle_id':  app['bundle_id'],
+            'path':       app['path'],
+            'latest':     latest or '',
+            'source':     source,
+            'cask_token': cask_token or '',
+        })
 
     t.join(timeout=40)
 
