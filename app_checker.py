@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -13,6 +13,21 @@ YEL = lambda t: _c("93", t)
 GRN = lambda t: _c("92", t)
 GRY = lambda t: _c("90", t)
 BLD = lambda t: _c("1",  t)
+
+def kill_old_instances():
+    """Kill any other running copies of this script so only one server runs."""
+    my_pid = os.getpid()
+    try:
+        r = subprocess.run(['pgrep', '-f', 'app_checker.py'], capture_output=True, text=True)
+        for pid_str in r.stdout.strip().split():
+            pid = int(pid_str)
+            if pid != my_pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
 
 def safe_print(*args, **kwargs):
     try:
@@ -266,50 +281,49 @@ def _install_zip(url, app_name):
         return True
 
 def do_update(app):
-    """Update a single app. Returns (success, opened_store)."""
+    """Trigger an update for the app. Returns (success, message)."""
     token = app.get('cask_token', '')
 
     # Microsoft Office → AutoUpdate tool
     if token in MICROSOFT_CASKS:
         if os.path.exists(MICROSOFT_AUTOUPDATE):
-            safe_print(f"  Opening Microsoft AutoUpdate...")
+            safe_print(f"  Opening Microsoft AutoUpdate for {app['name']}...")
             subprocess.run(['open', MICROSOFT_AUTOUPDATE])
-            return True, False
-        safe_print(f"  Opening {app['name']} to check for updates...")
+            return True, 'Microsoft AutoUpdate opened'
+        safe_print(f"  Opening {app['name']}...")
         subprocess.run(['open', '-a', app['name']])
-        return True, False
+        return True, 'App opened'
 
     if app['source'] == 'App Store':
         safe_print(f"  Opening App Store updates page...")
         subprocess.run(['open', 'macappstore://showUpdatesPage'])
-        return True, True
+        return True, 'App Store opened'
 
     if not token:
-        safe_print(f"  Launching {app['name']} to trigger its built-in updater...")
+        # No cask found — open the app so it can self-update
+        safe_print(f"  Opening {app['name']} to self-update...")
         subprocess.run(['open', '-a', app['name']])
-        return True, False
+        return True, 'App opened — check for updates inside the app'
 
-    safe_print(f"  Fetching download info for {app['name']}...", flush=True)
+    safe_print(f"  Fetching download link for {app['name']}...", flush=True)
     cask = fetch_cask(token)
     if not cask:
-        safe_print(GRY("  Could not get download info.")); return False, False
+        return False, 'Could not fetch download info'
 
     url      = cask.get('url', '')
     homepage = cask.get('homepage', '')
-    ext      = url.lower().split('?')[0].split('#')[0]
 
-    if ext.endswith('.dmg'):
-        return _install_dmg(url, app['name']), False
-    elif ext.endswith('.zip'):
-        return _install_zip(url, app['name']), False
+    # Open the download URL or homepage in browser — let the user install it
+    # (auto-installing to /Applications requires elevated permissions and
+    #  can crash if the app is running or permissions are restricted)
+    target = url or homepage
+    if target:
+        safe_print(f"  Opening download page for {app['name']}...")
+        subprocess.run(['open', target])
+        return True, 'Download page opened — install and replace the app when done'
     else:
-        safe_print(f"  This app requires a manual update.")
-        if homepage:
-            safe_print(f"  Opening homepage: {homepage}")
-            subprocess.run(['open', homepage])
-        else:
-            subprocess.run(['open', '-a', app['name']])
-        return False, False
+        subprocess.run(['open', '-a', app['name']])
+        return True, 'App opened'
 
 # ── HTML dashboard ────────────────────────────────────────────────────────────
 HTML_TEMPLATE = r"""<!doctype html>
@@ -465,8 +479,8 @@ async function doUpdate(btn,enc){
   try{
     const r=await fetch('/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
     const d=await r.json();
-    if(d.success){btn.textContent=d.opened_store?'App Store ↗':'✓ Done';btn.classList.add('ok')}
-    else{btn.textContent='✗ Manual';btn.classList.add('err');btn.disabled=false}
+    if(d.success){btn.textContent='✓ Done';btn.classList.add('ok')}
+    else{btn.textContent='✗ Failed';btn.classList.add('err');btn.disabled=false}
   }catch(e){btn.textContent='✗ Error';btn.classList.add('err');btn.disabled=false}
 }
 
@@ -529,20 +543,26 @@ def serve_dashboard(results, macos_info):
 
         def do_POST(self):
             if self.path == '/update':
-                length = int(self.headers.get('Content-Length', 0))
-                body   = json.loads(self.rfile.read(length) or b'{}')
-                name   = body.get('name', '')
-                app    = next((a for a in app_data['results'] if a['name'] == name), None)
-                if app:
-                    success, opened_store = do_update(app)
-                    resp = json.dumps({'success': success, 'opened_store': opened_store})
-                else:
-                    resp = json.dumps({'success': False, 'error': 'not found'})
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(resp.encode())
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                    body   = json.loads(self.rfile.read(length) or b'{}')
+                    name   = body.get('name', '')
+                    app    = next((a for a in app_data['results'] if a['name'] == name), None)
+                    if app:
+                        success, msg = do_update(app)
+                        resp = json.dumps({'success': success, 'msg': msg})
+                    else:
+                        resp = json.dumps({'success': False, 'msg': 'App not found'})
+                except Exception as e:
+                    resp = json.dumps({'success': False, 'msg': str(e)})
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(resp.encode())
+                except (BrokenPipeError, OSError):
+                    pass
 
     # Find an open port
     ThreadingTCPServer.allow_reuse_address = True
@@ -619,8 +639,17 @@ def scan_apps():
     return results, macos_result
 
 def main():
+    # Ignore SIGHUP early so the process survives when the .app terminal closes
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (AttributeError, OSError):
+        pass
+
     json_mode = '--json' in sys.argv
     gui_mode  = '--gui'  in sys.argv
+
+    if gui_mode:
+        kill_old_instances()
 
     if not json_mode:
         print(BLD(f"\nMac App Checker  v{__version__}"))
