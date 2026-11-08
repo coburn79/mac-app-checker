@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -134,10 +134,11 @@ def read_app_info(path):
         with open(plist_path, 'rb') as f:
             p = plistlib.load(f)
         return {
-            'name':      p.get('CFBundleName') or p.get('CFBundleDisplayName') or os.path.basename(path).replace('.app', ''),
-            'version':   p.get('CFBundleShortVersionString', 'Unknown'),
-            'bundle_id': p.get('CFBundleIdentifier', ''),
-            'path':      path,
+            'name':          p.get('CFBundleName') or p.get('CFBundleDisplayName') or os.path.basename(path).replace('.app', ''),
+            'version':       p.get('CFBundleShortVersionString', 'Unknown'),
+            'build_version': p.get('CFBundleVersion', ''),
+            'bundle_id':     p.get('CFBundleIdentifier', ''),
+            'path':          path,
         }
     except Exception:
         return None
@@ -656,8 +657,13 @@ def scan_apps():
             source = 'Apple'
 
         elif bundle_id.startswith(MICROSOFT_BUNDLE_PREFIX):
-            # Microsoft apps: always use Homebrew cask regardless of receipt,
-            # because mixed installs (some have MASReceipts) report wrong versions
+            # Microsoft apps: always use Homebrew cask regardless of receipt.
+            # Cask versions match CFBundleVersion (e.g. 16.114.26110224),
+            # not CFBundleShortVersionString (e.g. 16.114.4) — same release,
+            # different format. Use build_version for the comparison so we
+            # don't report false "update available" when the app is current.
+            if app.get('build_version'):
+                app = {**app, 'version': app['build_version']}
             token = normalize_to_token(app['name'])
             cask  = fetch_cask(token)
             if cask:
