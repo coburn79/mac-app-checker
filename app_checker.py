@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -368,173 +368,339 @@ HTML_TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mac App Checker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Serif+Text&family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
-:root{
-  --bg:#f7f5f2;--bg2:#edeae6;--bg3:#fff;
-  --fg:#1c1917;--fg2:#6b7280;--border:#e2ddd8;
-  --accent:#2563eb;
-  --upd:#b45309;--upd-bg:#fef3c7;
-  --ok:#15803d;--ok-bg:#f0fdf4;
-  --crit:#b91c1c;--crit-bg:#fff1f1;
-  --unk:#64748b;--unk-bg:#f1f5f9;
+/* Layout: sticky topbar + main content area with filter tiles and app cards */
+:root {
+  --bg:#f0f0f5;--surface:#ffffff;--surface2:#f5f5fa;
+  --border:#d8d8e0;--border2:#ebebf0;
+  --fg:#1a1a2e;--fg2:#6b6b80;--fg3:#9898a8;
+  --accent:#0057d8;--accent-bg:#e8f0ff;
+  --ok-fg:#1a7f4b;--ok-bg:#e8f8ef;
+  --upd-fg:#8a4a00;--upd-bg:#fff3e0;
+  --crit-fg:#b91c1c;--crit-bg:#fff1f1;
+  --unk-fg:#5c5c70;--unk-bg:#ebebf2;
+  --radius:12px;
 }
-@media(prefers-color-scheme:dark){
-  :root{
-    --bg:#111318;--bg2:#1c2030;--bg3:#1c2030;
-    --fg:#e9ecef;--fg2:#7a8899;--border:#2a3245;
-    --accent:#60a5fa;
-    --upd:#fbbf24;--upd-bg:#2c1900;
-    --ok:#34d399;--ok-bg:#052e16;
-    --crit:#f87171;--crit-bg:#2d0808;
-    --unk:#64748b;--unk-bg:#1c2030;
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#111117;--surface:#1e1e26;--surface2:#26262f;
+    --border:#2e2e3a;--border2:#252530;
+    --fg:#f0f0f8;--fg2:#9090a8;--fg3:#5a5a70;
+    --accent:#4d8bff;--accent-bg:#0d2040;
+    --ok-fg:#34d399;--ok-bg:#052e1a;
+    --upd-fg:#fbbf24;--upd-bg:#2c1a00;
+    --crit-fg:#f87171;--crit-bg:#2d0808;
+    --unk-fg:#8080a0;--unk-bg:#1e1e28;
+    color-scheme:dark;
   }
 }
+:root[data-theme="dark"] {
+  --bg:#111117;--surface:#1e1e26;--surface2:#26262f;
+  --border:#2e2e3a;--border2:#252530;
+  --fg:#f0f0f8;--fg2:#9090a8;--fg3:#5a5a70;
+  --accent:#4d8bff;--accent-bg:#0d2040;
+  --ok-fg:#34d399;--ok-bg:#052e1a;
+  --upd-fg:#fbbf24;--upd-bg:#2c1a00;
+  --crit-fg:#f87171;--crit-bg:#2d0808;
+  --unk-fg:#8080a0;--unk-bg:#1e1e28;
+  color-scheme:dark;
+}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'DM Sans',system-ui,sans-serif;background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5;padding:32px 24px;max-width:940px;margin:0 auto}
-h1{font-family:'DM Serif Text',serif;font-size:30px;font-weight:400;margin-bottom:4px;letter-spacing:-.01em}
-.sub{color:var(--fg2);font-size:13px;margin-bottom:20px}
-.macos-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:20px;font-size:13px}
-.macos-label{color:var(--fg2);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:24px}
-@media(max-width:520px){.stats{grid-template-columns:repeat(2,1fr)}}
-.stat{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:14px 16px;cursor:pointer;transition:border-color .15s}
-.stat:hover,.stat.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
-.stat-num{font-family:'JetBrains Mono',monospace;font-size:26px;font-weight:500;line-height:1;margin-bottom:5px;font-variant-numeric:tabular-nums}
-.stat-label{font-size:11px;color:var(--fg2);text-transform:uppercase;letter-spacing:.06em}
-.stat-all .stat-num{color:var(--fg)}
-.stat-upd .stat-num{color:var(--upd)}
-.stat-ok  .stat-num{color:var(--ok)}
-.stat-unk .stat-num{color:var(--unk)}
-.toolbar{display:flex;justify-content:flex-end;margin-bottom:12px}
-.btn-all{padding:8px 18px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
-.btn-all:hover{opacity:.85}
-.btn-all:disabled{opacity:.5;cursor:default}
-.btn-quit{padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:13px;cursor:pointer;transition:all .15s}
-.btn-quit:hover{border-color:var(--crit);color:var(--crit)}
-.shell{background:var(--bg3);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:13px}
-thead{background:var(--bg2)}
-th{text-align:left;padding:10px 16px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg2);border-bottom:1px solid var(--border);white-space:nowrap}
-td{padding:11px 16px;border-bottom:1px solid var(--border);vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:var(--bg2)}
-.app-name{font-weight:500}
-.ver{font-family:'JetBrains Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums;color:var(--fg2)}
-.ver.i{color:var(--fg)}
-.arrow{color:var(--fg2);padding:0 4px;font-size:11px}
-.vc{display:flex;align-items:center;flex-wrap:wrap;gap:2px}
-.badge{display:inline-block;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
-.b-upd{background:var(--upd-bg);color:var(--upd)}
-.b-crit{background:var(--crit-bg);color:var(--crit)}
-.b-ok{background:var(--ok-bg);color:var(--ok)}
-.b-unk{background:var(--unk-bg);color:var(--unk)}
-.b-sys{background:var(--unk-bg);color:var(--unk)}
-.btn-upd{display:inline-block;padding:4px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap;text-decoration:none}
-.btn-upd:hover{border-color:var(--accent);color:var(--accent)}
-.btn-upd:disabled{opacity:.5;cursor:default}
-.btn-upd.ok{border-color:var(--ok);color:var(--ok)}
-.btn-upd.err{border-color:var(--crit);color:var(--crit)}
-.empty{text-align:center;padding:48px;color:var(--fg2);font-style:italic}
-@media(max-width:600px){.col-src{display:none}}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5;min-height:100vh}
+
+/* ── Top bar ── */
+.topbar{position:sticky;top:0;z-index:20;background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.brand{display:flex;flex-direction:column;gap:1px}
+.brand-name{font-size:17px;font-weight:700;letter-spacing:-.025em;color:var(--fg)}
+.brand-sub{font-size:11px;color:var(--fg2)}
+.btn-quit{padding:6px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:inherit;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-quit:hover{border-color:var(--crit-fg);color:var(--crit-fg)}
+
+/* ── Quit confirmation modal ── */
+.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;align-items:center;justify-content:center}
+.modal-backdrop.open{display:flex}
+.modal{background:var(--surface);border-radius:18px;padding:28px 28px 24px;max-width:340px;width:calc(100% - 48px);text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.modal-icon{font-size:34px;margin-bottom:10px}
+.modal-title{font-size:17px;font-weight:700;margin-bottom:6px}
+.modal-desc{font-size:13px;color:var(--fg2);margin-bottom:22px;line-height:1.5}
+.modal-btns{display:flex;gap:10px;justify-content:center}
+.modal-btn{padding:9px 22px;border-radius:10px;font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.modal-cancel{border:1px solid var(--border);background:transparent;color:var(--fg)}
+.modal-cancel:hover{background:var(--surface2)}
+.modal-stop{border:none;background:var(--crit-fg);color:#fff}
+.modal-stop:hover{opacity:.88}
+
+/* ── Main layout ── */
+.main{max-width:860px;margin:0 auto;padding:22px 24px 56px}
+
+/* ── macOS status card ── */
+.macos-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:13px 16px;display:flex;align-items:center;gap:12px;margin-bottom:18px;font-size:13px}
+.macos-icon{font-size:22px;flex-shrink:0;line-height:1}
+.macos-info{display:flex;flex-direction:column;gap:1px}
+.macos-name{font-weight:600;font-size:13px}
+.macos-status{font-size:12px;color:var(--fg2)}
+.macos-status.ok{color:var(--ok-fg)}
+.macos-status.upd{color:var(--upd-fg);font-weight:500}
+
+/* ── Filter tiles ── */
+.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
+@media(max-width:520px){.filters{grid-template-columns:repeat(2,1fr)}}
+.ftile{background:var(--surface);border:2px solid transparent;border-radius:var(--radius);padding:14px 16px;cursor:pointer;transition:border-color .15s,background .15s;user-select:none}
+.ftile:hover{border-color:var(--border)}
+.ftile.active{border-color:var(--accent);background:var(--accent-bg)}
+.ftile-n{font-size:28px;font-weight:700;line-height:1.1;letter-spacing:-.035em;font-variant-numeric:tabular-nums;margin-bottom:3px}
+.ftile-l{font-size:11px;font-weight:500;letter-spacing:.02em;color:var(--fg2)}
+.t-all .ftile-n{color:var(--fg)}
+.t-upd .ftile-n{color:var(--upd-fg)}
+.t-ok  .ftile-n{color:var(--ok-fg)}
+.t-unk .ftile-n{color:var(--unk-fg)}
+
+/* ── Toolbar ── */
+.toolbar{display:flex;justify-content:flex-end;margin-bottom:12px;min-height:34px}
+.btn-all{padding:8px 20px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s,transform .1s;box-shadow:0 2px 8px rgba(0,87,216,.25)}
+.btn-all:hover{opacity:.9;transform:translateY(-1px)}
+.btn-all:active{transform:none}
+.btn-all:disabled{opacity:.5;cursor:default;transform:none;box-shadow:none}
+
+/* ── App cards ── */
+.app-list{display:flex;flex-direction:column;gap:4px}
+.app-card{background:var(--surface);border:1px solid var(--border2);border-radius:10px;padding:11px 14px;display:flex;align-items:center;gap:12px;transition:box-shadow .15s}
+.app-card:hover{box-shadow:0 2px 8px rgba(0,0,0,.07)}
+.app-card.needs-update{border-left:3px solid var(--upd-fg)}
+.app-card.outdated{border-left:3px solid var(--crit-fg)}
+
+/* ── Avatar ── */
+.avatar{width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;flex-shrink:0;letter-spacing:-.02em}
+
+/* ── App info ── */
+.app-info{flex:1;min-width:0}
+.app-nm{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app-meta{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:2px;font-size:11px;color:var(--fg2)}
+.ver-cur{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;color:var(--fg2)}
+.ver-arr{color:var(--fg3);padding:0 1px}
+.ver-new{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;color:var(--upd-fg);font-weight:500}
+.src-pill{font-size:10px;font-weight:500;padding:1px 7px;border-radius:99px;border:1px solid var(--border);background:var(--surface2);color:var(--fg3);white-space:nowrap;letter-spacing:.01em}
+
+/* ── Status badge ── */
+.badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:600;letter-spacing:.02em;white-space:nowrap;cursor:default}
+.b-upd{background:var(--upd-bg);color:var(--upd-fg)}
+.b-crit{background:var(--crit-bg);color:var(--crit-fg)}
+.b-ok{background:var(--ok-bg);color:var(--ok-fg)}
+.b-unk{background:var(--unk-bg);color:var(--unk-fg)}
+.b-sys{background:var(--unk-bg);color:var(--unk-fg)}
+.badge-col{flex-shrink:0}
+
+/* ── Action buttons ── */
+.btn-action{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;border-radius:8px;font-family:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:all .12s;white-space:nowrap;text-decoration:none}
+.btn-do{background:var(--accent);color:#fff;border:none;box-shadow:0 1px 4px rgba(0,87,216,.2)}
+.btn-do:hover{opacity:.88;transform:translateY(-1px)}
+.btn-do:disabled{opacity:.5;cursor:default;transform:none;box-shadow:none}
+.btn-do.done{background:var(--ok-bg);color:var(--ok-fg);box-shadow:none}
+.btn-do.failed{background:var(--crit-bg);color:var(--crit-fg);box-shadow:none}
+.btn-store{background:transparent;color:var(--accent);border:1.5px solid var(--accent)}
+.btn-store:hover{background:var(--accent-bg)}
+.btn-visit{background:transparent;color:var(--fg2);border:1px solid var(--border)}
+.btn-visit:hover{border-color:var(--fg2);color:var(--fg)}
+.action-col{flex-shrink:0}
+
+/* ── Tooltip ── */
+[title]{cursor:help}
+
+/* ── Empty state ── */
+.empty-state{text-align:center;padding:52px 24px}
+.empty-icon{font-size:38px;margin-bottom:10px}
+.empty-title{font-weight:600;font-size:16px;color:var(--fg);margin-bottom:5px}
+.empty-desc{font-size:13px;color:var(--fg2)}
+
+@media(max-width:580px){.badge-col{display:none}}
+@media(max-width:420px){.app-card{padding:10px 12px;gap:9px}}
 </style>
 </head>
 <body>
-<h1>Mac App Checker</h1>
-<p class="sub" id="sub"></p>
-<div class="macos-bar" id="macos"></div>
-<div class="stats" id="stats"></div>
-<div class="toolbar" id="toolbar" style="justify-content:space-between">
-  <button class="btn-quit" onclick="if(confirm('Stop Mac App Checker?'))location.href='/quit'">Quit</button>
-  <button class="btn-all" id="btn-all" onclick="updateAll()" hidden>Update All</button>
+
+<div class="topbar">
+  <div class="brand">
+    <span class="brand-name">Mac App Checker</span>
+    <span class="brand-sub" id="sub">Checking your apps…</span>
+  </div>
+  <button class="btn-quit" onclick="document.getElementById('quit-modal').classList.add('open')">Quit</button>
 </div>
-<div class="shell">
-  <div class="wrap">
-    <table>
-      <thead><tr>
-        <th>App</th><th>Versions</th>
-        <th class="col-src">Source</th>
-        <th>Status</th><th></th>
-      </tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
-    <div class="empty" id="empty" hidden>No apps match this filter.</div>
+
+<div class="modal-backdrop" id="quit-modal">
+  <div class="modal">
+    <div class="modal-icon">🛑</div>
+    <div class="modal-title">Stop Mac App Checker?</div>
+    <div class="modal-desc">The dashboard will close and the background service will stop running.</div>
+    <div class="modal-btns">
+      <button class="modal-btn modal-cancel" onclick="document.getElementById('quit-modal').classList.remove('open')">Cancel</button>
+      <button class="modal-btn modal-stop" onclick="location.href='/quit'">Stop</button>
+    </div>
   </div>
 </div>
-<script>
-const D=__DATA__;
-let f='all';
-const cv=v=>v?v.split(',')[0]:'';
-const BM={update:'b-upd',behind:'b-crit',current:'b-ok',unknown:'b-unk',system:'b-sys'};
-const BL={update:'Update',behind:'Far behind',current:'Current',unknown:'Unknown',system:'System'};
 
-function render(){
-  const all=D.apps, upd=all.filter(a=>a.status==='update'||a.status==='behind'),
-        ok=all.filter(a=>a.status==='current'), unk=all.filter(a=>a.status==='unknown'||a.status==='system');
-  document.getElementById('sub').textContent=
-    `Scanned ${all.length} apps · ${new Date().toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})}`;
-  const m=D.macos||{};
-  document.getElementById('macos').innerHTML=m.has_update
-    ?`<span class="macos-label">macOS</span><b>${m.version}</b><span style="color:var(--upd)">Update available: ${(m.updates||[]).slice(0,2).join(', ')}</span>`
-    :`<span class="macos-label">macOS</span><b>${m.version||'—'}</b><span style="color:var(--ok)">${m.version?'✓ Up to date':'Could not check'}</span>`;
-  const defs=[
-    {k:'all',cls:'stat-all',n:all.length,l:'All apps'},
-    {k:'upd',cls:'stat-upd',n:upd.length,l:'Need updates'},
-    {k:'ok', cls:'stat-ok', n:ok.length, l:'Up to date'},
-    {k:'unk',cls:'stat-unk',n:unk.length,l:'Unknown'},
+<div class="main">
+  <div class="macos-card" id="macos"></div>
+  <div class="filters" id="filters"></div>
+  <div class="toolbar" id="toolbar"></div>
+  <div class="app-list" id="app-list"></div>
+  <div class="empty-state" id="empty" style="display:none">
+    <div class="empty-icon">🔍</div>
+    <div class="empty-title">No apps match this filter</div>
+    <div class="empty-desc">Try a different category above.</div>
+  </div>
+</div>
+
+<script>
+const D = __DATA__;
+let currentFilter = 'all';
+
+function avatarColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
+  const hue = ((h % 360) + 360) % 360;
+  return 'hsl(' + hue + ',50%,44%)';
+}
+function avatarLetters(name) {
+  const w = name.trim().split(/\s+/);
+  return w.length >= 2 ? (w[0][0] + w[1][0]).toUpperCase() : name.slice(0,2).toUpperCase();
+}
+
+const SOURCE_LABELS = {
+  'App Store': 'Mac App Store',
+  'Homebrew Cask': 'Web download',
+  'Direct': 'Web download',
+  'Apple': 'Built into Mac',
+};
+function friendlySrc(s) { return SOURCE_LABELS[s] || s; }
+
+const STATUS = {
+  update:  {cls:'b-upd', label:'Update available', tip:''},
+  behind:  {cls:'b-crit', label:'Outdated', tip:'This app is several versions behind'},
+  current: {cls:'b-ok',  label:'Up to date', tip:''},
+  unknown: {cls:'b-unk', label:"Can't check", tip:"We couldn't find update info for this app"},
+  system:  {cls:'b-sys', label:'Built-in app', tip:'This app is part of macOS and updates with your Mac'},
+};
+
+function cleanVer(v) { return v ? v.split(',')[0] : ''; }
+
+function render() {
+  const apps = D.apps;
+  const needsUpd = apps.filter(a => a.status === 'update' || a.status === 'behind');
+  const upToDate = apps.filter(a => a.status === 'current');
+  const cantChk  = apps.filter(a => a.status === 'unknown' || a.status === 'system');
+
+  const dateStr = new Date().toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
+  document.getElementById('sub').textContent = apps.length + ' apps checked · ' + dateStr;
+
+  // macOS card
+  const m = D.macos || {};
+  const macosEl = document.getElementById('macos');
+  if (m.has_update) {
+    macosEl.innerHTML = '<div class="macos-icon">🍎</div><div class="macos-info"><div class="macos-name">Your Mac · ' + (m.version||'') + '</div><div class="macos-status upd">macOS update available: ' + (m.updates||[]).slice(0,2).join(', ') + '</div></div>';
+  } else {
+    macosEl.innerHTML = '<div class="macos-icon">🍎</div><div class="macos-info"><div class="macos-name">Your Mac · ' + (m.version||'Unknown') + '</div><div class="macos-status ok">' + (m.version ? '✓ Your Mac is up to date' : 'Could not check for Mac updates') + '</div></div>';
+  }
+
+  // Filter tiles
+  const tiles = [
+    {k:'all', cls:'t-all', n:apps.length,     l:'All Apps'},
+    {k:'upd', cls:'t-upd', n:needsUpd.length, l: needsUpd.length === 1 ? 'Needs Update' : 'Need Updating'},
+    {k:'ok',  cls:'t-ok',  n:upToDate.length, l:'Up to Date'},
+    {k:'unk', cls:'t-unk', n:cantChk.length,  l:"Can\'t Check"},
   ];
-  document.getElementById('stats').innerHTML=defs.map(d=>
-    `<div class="stat ${d.cls}${d.k===f?' active':''}" onclick="setF('${d.k}')">
-      <div class="stat-num">${d.n}</div><div class="stat-label">${d.l}</div></div>`).join('');
-  document.getElementById('btn-all').hidden=upd.length===0;
-  const fm={all:null,upd:['update','behind'],ok:['current'],unk:['unknown','system']};
-  const rows=fm[f]?all.filter(a=>fm[f].includes(a.status)):all;
-  document.getElementById('empty').hidden=rows.length>0;
-  document.getElementById('tbody').innerHTML=rows.map(a=>{
-    const v=cv(a.latest)||'';
-    const vc=a.status==='current'||!v
-      ?`<span class="ver i">${a.installed}</span>`
-      :`<span class="ver i">${a.installed}</span><span class="arrow">→</span><span class="ver">${v}</span>`;
-    const id='b-'+a.name.replace(/\s+/g,'-');
-    const btn=(a.status==='update'||a.status==='behind')
-      ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">Update</button>`
-      :(a.status==='system')
-      ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">App Store</button>`
-      :(a.status==='unknown'&&a.homepage)
-      ?`<a class="btn-upd" href="${a.homepage}" target="_blank" rel="noopener">Visit ↗</a>`
-      :'';
-    return `<tr><td><span class="app-name">${a.name}</span></td>
-      <td><div class="vc">${vc}</div></td>
-      <td class="col-src" style="color:var(--fg2);font-size:12px">${a.source}</td>
-      <td><span class="badge ${BM[a.status]}">${BL[a.status]}</span></td>
-      <td>${btn}</td></tr>`;
+  document.getElementById('filters').innerHTML = tiles.map(t =>
+    '<div class="ftile ' + t.cls + (t.k === currentFilter ? ' active' : '') + '" onclick="setFilter(\'' + t.k + '\')">' +
+    '<div class="ftile-n">' + t.n + '</div><div class="ftile-l">' + t.l + '</div></div>'
+  ).join('');
+
+  // Update All button
+  const toolbar = document.getElementById('toolbar');
+  toolbar.innerHTML = needsUpd.length > 0
+    ? '<button class="btn-all" id="btn-all" onclick="updateAll()">Update All (' + needsUpd.length + ')</button>'
+    : '';
+
+  // App list
+  const fmap = {all:null, upd:['update','behind'], ok:['current'], unk:['unknown','system']};
+  const sf = fmap[currentFilter];
+  const rows = sf ? apps.filter(a => sf.includes(a.status)) : apps;
+  const listEl = document.getElementById('app-list');
+  const emptyEl = document.getElementById('empty');
+
+  if (rows.length === 0) {
+    listEl.innerHTML = '';
+    emptyEl.style.display = 'block';
+    return;
+  }
+  emptyEl.style.display = 'none';
+
+  listEl.innerHTML = rows.map(a => {
+    const id = 'btn-' + a.name.replace(/[^a-z0-9]/gi, '-');
+    const si = STATUS[a.status] || STATUS.unknown;
+    const lv = cleanVer(a.latest) || '';
+    const isUpd = a.status === 'update' || a.status === 'behind';
+
+    const verHtml = (isUpd && lv)
+      ? '<span class="ver-cur">' + a.installed + '</span><span class="ver-arr"> → </span><span class="ver-new">' + lv + '</span>'
+      : '<span class="ver-cur">' + a.installed + '</span>';
+
+    let actionHtml = '';
+    if (isUpd) {
+      actionHtml = '<button class="btn-action btn-do" id="' + id + '" onclick="doUpdate(this,\'' + encodeURIComponent(a.name) + '\')">Update</button>';
+    } else if (a.status === 'system') {
+      actionHtml = '<button class="btn-action btn-store" id="' + id + '" onclick="doUpdate(this,\'' + encodeURIComponent(a.name) + '\')">Open App Store</button>';
+    } else if (a.status === 'unknown' && a.homepage) {
+      actionHtml = '<a class="btn-action btn-visit" href="' + a.homepage + '" target="_blank" rel="noopener">Get update ↗</a>';
+    }
+
+    const cardCls = a.status === 'behind' ? ' outdated' : (isUpd ? ' needs-update' : '');
+    const badgeTip = si.tip ? ' title="' + si.tip + '"' : '';
+
+    return '<div class="app-card' + cardCls + '">' +
+      '<div class="avatar" style="background:' + avatarColor(a.name) + '">' + avatarLetters(a.name) + '</div>' +
+      '<div class="app-info">' +
+        '<div class="app-nm">' + a.name + '</div>' +
+        '<div class="app-meta">' + verHtml + '<span class="src-pill">' + friendlySrc(a.source) + '</span></div>' +
+      '</div>' +
+      '<div class="badge-col"><span class="badge ' + si.cls + '"' + badgeTip + '>' + si.label + '</span></div>' +
+      '<div class="action-col">' + actionHtml + '</div>' +
+      '</div>';
   }).join('');
 }
 
-function setF(v){f=v;render()}
+function setFilter(v) { currentFilter = v; render(); }
 
-async function doUpdate(btn,enc){
-  const name=decodeURIComponent(enc);
-  btn.disabled=true; btn.textContent='Updating…';
-  try{
-    const r=await fetch('/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
-    const d=await r.json();
-    if(d.success){btn.textContent='✓ Done';btn.title=d.msg||'';btn.classList.add('ok')}
-    else{btn.textContent='✗ Failed';btn.title=d.msg||'';btn.classList.add('err');btn.disabled=false}
-  }catch(e){btn.textContent='✗ Error';btn.classList.add('err');btn.disabled=false}
-}
-
-async function updateAll(){
-  const btn=document.getElementById('btn-all');
-  btn.disabled=true; btn.textContent='Updating…';
-  const apps=D.apps.filter(a=>a.status==='update'||a.status==='behind');
-  for(const a of apps){
-    const b=document.getElementById('b-'+a.name.replace(/\s+/g,'-'));
-    if(b&&!b.classList.contains('ok'))await doUpdate(b,encodeURIComponent(a.name));
+async function doUpdate(btn, enc) {
+  const name = decodeURIComponent(enc);
+  btn.disabled = true; btn.textContent = 'Updating…';
+  try {
+    const r = await fetch('/update', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+    const d = await r.json();
+    if (d.success) {
+      btn.textContent = '✓ Done'; btn.title = d.msg || '';
+      btn.classList.remove('btn-do'); btn.classList.add('done');
+    } else {
+      btn.textContent = '✕ Failed'; btn.title = d.msg || '';
+      btn.classList.remove('btn-do'); btn.classList.add('failed'); btn.disabled = false;
+    }
+  } catch(e) {
+    btn.textContent = '✕ Error';
+    btn.classList.remove('btn-do'); btn.classList.add('failed'); btn.disabled = false;
   }
-  btn.textContent='Done';
 }
+
+async function updateAll() {
+  const btn = document.getElementById('btn-all');
+  if (!btn) return;
+  btn.disabled = true; btn.textContent = 'Updating…';
+  const apps = D.apps.filter(a => a.status === 'update' || a.status === 'behind');
+  for (const a of apps) {
+    const b = document.getElementById('btn-' + a.name.replace(/[^a-z0-9]/gi, '-'));
+    if (b && !b.classList.contains('done')) await doUpdate(b, encodeURIComponent(a.name));
+  }
+  btn.textContent = 'All done ✓';
+}
+
 render();
 </script>
 </body></html>"""
