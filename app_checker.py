@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -176,9 +176,17 @@ def versions_equal(v1, v2_raw):
     norm = lambda v: re.sub(r'(\.0)+$', '', v)
     return norm(v1) == norm(v2)
 
+def is_prerelease(v):
+    """Return True if version string looks like a beta/alpha/rc/pre release."""
+    s = clean_ver(v).lower()
+    return bool(re.search(r'(alpha|beta|\.pre|[-_]rc|[-_]pre|b\d*$|a\d*$)', s))
+
 def is_newer(installed, latest_raw):
     cv = clean_ver(latest_raw)
     if versions_equal(installed, latest_raw):
+        return False
+    # Don't treat a pre-release cask version as an update over a stable install
+    if is_prerelease(cv) and not is_prerelease(installed):
         return False
     def parse(v):
         return [int(x) if x.isdigit() else x for x in re.split(r'[.\-_]', v)]
