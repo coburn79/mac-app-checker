@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -89,6 +89,13 @@ APPLE_SYSTEM_BUNDLES = {
 # Apps to hide — noise the user doesn't need to see
 HIDE_BUNDLE_IDS = {''}          # catches apps with no bundle ID (e.g. our own .app)
 HIDE_APP_NAMES  = {'Mac App Checker', 'Microsoft AutoUpdate'}
+
+# Manual homepage URLs for direct-download apps that have no Homebrew cask
+HOMEPAGE_OVERRIDES = {
+    'vmware fusion':          'https://www.vmware.com/products/fusion.html',
+    'sky go':                 'https://www.sky.com/shop/tv/sky-go',
+    'photos for google photos': 'https://apps.apple.com/app/id962194608',
+}
 
 # ── Network ───────────────────────────────────────────────────────────────────
 def fetch_url(url, timeout=10):
@@ -415,7 +422,7 @@ tr:hover td{background:var(--bg2)}
 .b-ok{background:var(--ok-bg);color:var(--ok)}
 .b-unk{background:var(--unk-bg);color:var(--unk)}
 .b-sys{background:var(--unk-bg);color:var(--unk)}
-.btn-upd{padding:4px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-upd{display:inline-block;padding:4px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap;text-decoration:none}
 .btn-upd:hover{border-color:var(--accent);color:var(--accent)}
 .btn-upd:disabled{opacity:.5;cursor:default}
 .btn-upd.ok{border-color:var(--ok);color:var(--ok)}
@@ -485,6 +492,8 @@ function render(){
       ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">Update</button>`
       :(a.status==='system')
       ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">App Store</button>`
+      :(a.status==='unknown'&&a.homepage)
+      ?`<a class="btn-upd" href="${a.homepage}" target="_blank" rel="noopener">Visit ↗</a>`
       :'';
     return `<tr><td><span class="app-name">${a.name}</span></td>
       <td><div class="vc">${vc}</div></td>
@@ -640,6 +649,8 @@ def scan_apps():
 
         latest = cask_token = None
 
+        homepage = ''
+
         if bundle_id in APPLE_SYSTEM_BUNDLES:
             # Apple's own apps: iTunes API returns nothing; they update via App Store
             source = 'Apple'
@@ -651,24 +662,28 @@ def scan_apps():
             cask  = fetch_cask(token)
             if cask:
                 latest     = cask.get('version')
+                homepage   = cask.get('homepage', '')
                 source     = 'Homebrew Cask'
                 cask_token = token
             else:
                 source = 'Direct'
 
         elif is_app_store_app(app['path']):
-            latest = fetch_mas(bundle_id)
-            source = 'App Store'
+            latest   = fetch_mas(bundle_id)
+            homepage = f'https://itunes.apple.com/app?bundleId={bundle_id}'
+            source   = 'App Store'
 
         else:
             token = normalize_to_token(app['name'])
             cask  = fetch_cask(token)
             if cask:
                 latest     = cask.get('version')
+                homepage   = cask.get('homepage', '')
                 source     = 'Homebrew Cask'
                 cask_token = token
             else:
-                source = 'Direct'
+                source   = 'Direct'
+                homepage = HOMEPAGE_OVERRIDES.get(app['name'].lower(), '')
 
         time.sleep(0.05)
         results.append({
@@ -678,6 +693,7 @@ def scan_apps():
             'path':       app['path'],
             'latest':     latest or '',
             'source':     source,
+            'homepage':   homepage,
             'cask_token': cask_token or '',
         })
 
