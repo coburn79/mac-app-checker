@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, shutil, threading, signal
 
@@ -75,6 +75,21 @@ MICROSOFT_CASKS = {
 }
 MICROSOFT_AUTOUPDATE = '/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app'
 
+# Apps whose bundle ID starts with com.microsoft.* → always use Homebrew cask
+# (some have App Store receipts from mixed installs, but cask has the real version)
+MICROSOFT_BUNDLE_PREFIX = 'com.microsoft.'
+
+# Apple system/bundled apps that update with macOS or via Mac App Store
+# iTunes lookup API returns nothing for these, so we show them as "System"
+APPLE_SYSTEM_BUNDLES = {
+    'com.apple.Safari', 'com.apple.iWork.Keynote', 'com.apple.iWork.Numbers',
+    'com.apple.iWork.Pages', 'com.apple.mail', 'com.apple.Photos',
+}
+
+# Apps to hide — noise the user doesn't need to see
+HIDE_BUNDLE_IDS = {''}          # catches apps with no bundle ID (e.g. our own .app)
+HIDE_APP_NAMES  = {'Mac App Checker', 'Microsoft AutoUpdate'}
+
 # ── Network ───────────────────────────────────────────────────────────────────
 def fetch_url(url, timeout=10):
     try:
@@ -94,9 +109,10 @@ def fetch_cask(token):
     return d if d and 'version' in d else None
 
 def fetch_mas(bundle_id):
-    d = fetch_url(f'https://itunes.apple.com/lookup?bundleId={bundle_id}&country=us')
-    if d and d.get('resultCount', 0) > 0:
-        return d['results'][0].get('version')
+    for country in ('us', 'gb'):
+        d = fetch_url(f'https://itunes.apple.com/lookup?bundleId={bundle_id}&country={country}')
+        if d and d.get('resultCount', 0) > 0:
+            return d['results'][0].get('version')
     return None
 
 # ── App scanning ──────────────────────────────────────────────────────────────
@@ -164,6 +180,8 @@ def is_newer(installed, latest_raw):
         return cv != installed
 
 def get_status(app):
+    if app.get('source') == 'Apple':
+        return 'system'
     if not app.get('latest'):
         return 'unknown'
     if versions_equal(app['installed'], app['latest']):
@@ -300,7 +318,7 @@ def do_update(app):
         subprocess.run(['open', '-a', app['name']])
         return True, 'App opened'
 
-    if app['source'] == 'App Store':
+    if app['source'] in ('App Store', 'Apple'):
         safe_print(f"  Opening App Store updates page...")
         subprocess.run(['open', 'macappstore://showUpdatesPage'])
         return True, 'App Store opened'
@@ -396,6 +414,7 @@ tr:hover td{background:var(--bg2)}
 .b-crit{background:var(--crit-bg);color:var(--crit)}
 .b-ok{background:var(--ok-bg);color:var(--ok)}
 .b-unk{background:var(--unk-bg);color:var(--unk)}
+.b-sys{background:var(--unk-bg);color:var(--unk)}
 .btn-upd{padding:4px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}
 .btn-upd:hover{border-color:var(--accent);color:var(--accent)}
 .btn-upd:disabled{opacity:.5;cursor:default}
@@ -431,12 +450,12 @@ tr:hover td{background:var(--bg2)}
 const D=__DATA__;
 let f='all';
 const cv=v=>v?v.split(',')[0]:'';
-const BM={update:'b-upd',behind:'b-crit',current:'b-ok',unknown:'b-unk'};
-const BL={update:'Update',behind:'Far behind',current:'Current',unknown:'Unknown'};
+const BM={update:'b-upd',behind:'b-crit',current:'b-ok',unknown:'b-unk',system:'b-sys'};
+const BL={update:'Update',behind:'Far behind',current:'Current',unknown:'Unknown',system:'System'};
 
 function render(){
   const all=D.apps, upd=all.filter(a=>a.status==='update'||a.status==='behind'),
-        ok=all.filter(a=>a.status==='current'), unk=all.filter(a=>a.status==='unknown');
+        ok=all.filter(a=>a.status==='current'), unk=all.filter(a=>a.status==='unknown'||a.status==='system');
   document.getElementById('sub').textContent=
     `Scanned ${all.length} apps · ${new Date().toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})}`;
   const m=D.macos||{};
@@ -453,7 +472,7 @@ function render(){
     `<div class="stat ${d.cls}${d.k===f?' active':''}" onclick="setF('${d.k}')">
       <div class="stat-num">${d.n}</div><div class="stat-label">${d.l}</div></div>`).join('');
   document.getElementById('btn-all').hidden=upd.length===0;
-  const fm={all:null,upd:['update','behind'],ok:['current'],unk:['unknown']};
+  const fm={all:null,upd:['update','behind'],ok:['current'],unk:['unknown','system']};
   const rows=fm[f]?all.filter(a=>fm[f].includes(a.status)):all;
   document.getElementById('empty').hidden=rows.length>0;
   document.getElementById('tbody').innerHTML=rows.map(a=>{
@@ -463,7 +482,10 @@ function render(){
       :`<span class="ver i">${a.installed}</span><span class="arrow">→</span><span class="ver">${v}</span>`;
     const id='b-'+a.name.replace(/\s+/g,'-');
     const btn=(a.status==='update'||a.status==='behind')
-      ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">Update</button>`:'';
+      ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">Update</button>`
+      :(a.status==='system')
+      ?`<button class="btn-upd" id="${id}" onclick="doUpdate(this,'${encodeURIComponent(a.name)}')">App Store</button>`
+      :'';
     return `<tr><td><span class="app-name">${a.name}</span></td>
       <td><div class="vc">${vc}</div></td>
       <td class="col-src" style="color:var(--fg2);font-size:12px">${a.source}</td>
@@ -598,6 +620,7 @@ STATUS_LABEL = {
     'behind':  RED('Far behind'),
     'current': GRN('Current'),
     'unknown': GRY('Unknown'),
+    'system':  GRY('System app'),
 }
 
 def scan_apps():
@@ -609,10 +632,34 @@ def scan_apps():
     apps = find_apps()
     results = []
     for app in apps:
+        bundle_id = app['bundle_id']
+
+        # Skip noisy/irrelevant apps
+        if app['name'] in HIDE_APP_NAMES or bundle_id in HIDE_BUNDLE_IDS:
+            continue
+
         latest = cask_token = None
-        if is_app_store_app(app['path']):
-            latest = fetch_mas(app['bundle_id'])
+
+        if bundle_id in APPLE_SYSTEM_BUNDLES:
+            # Apple's own apps: iTunes API returns nothing; they update via App Store
+            source = 'Apple'
+
+        elif bundle_id.startswith(MICROSOFT_BUNDLE_PREFIX):
+            # Microsoft apps: always use Homebrew cask regardless of receipt,
+            # because mixed installs (some have MASReceipts) report wrong versions
+            token = normalize_to_token(app['name'])
+            cask  = fetch_cask(token)
+            if cask:
+                latest     = cask.get('version')
+                source     = 'Homebrew Cask'
+                cask_token = token
+            else:
+                source = 'Direct'
+
+        elif is_app_store_app(app['path']):
+            latest = fetch_mas(bundle_id)
             source = 'App Store'
+
         else:
             token = normalize_to_token(app['name'])
             cask  = fetch_cask(token)
@@ -622,11 +669,12 @@ def scan_apps():
                 cask_token = token
             else:
                 source = 'Direct'
+
         time.sleep(0.05)
         results.append({
             'name':       app['name'],
             'installed':  app['version'],
-            'bundle_id':  app['bundle_id'],
+            'bundle_id':  bundle_id,
             'path':       app['path'],
             'latest':     latest or '',
             'source':     source,
