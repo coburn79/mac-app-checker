@@ -628,7 +628,7 @@ let currentFilter='all';
 function avatarColor(name){
   let h=0;
   for(let i=0;i<name.length;i++)h=name.charCodeAt(i)+((h<<5)-h);
-  return'hsl('+((((h%360)+360)%360)+',50%,44%)';
+  return'hsl('+(((h%360)+360)%360)+',50%,44%)';
 }
 function avatarLetters(name){
   const w=name.trim().split(/\s+/);
