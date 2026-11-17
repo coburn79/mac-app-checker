@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal
 import logging
@@ -86,7 +86,6 @@ MICROSOFT_CASKS = {
     'microsoft-onenote', 'microsoft-outlook', 'microsoft-teams', 'microsoft-edge',
 }
 MICROSOFT_AUTOUPDATE = '/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app'
-MSUPDATE = '/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app/Contents/MacOS/msupdate'
 MICROSOFT_BUNDLE_PREFIX = 'com.microsoft.'
 
 APPLE_SYSTEM_BUNDLES = {
@@ -369,17 +368,6 @@ def do_update(app):
     """Trigger an update for the app. Returns (success, message)."""
     token = app.get('cask_token', '')
     LOG.info(f'Update requested: {app["name"]} (token={token!r}, source={app["source"]})')
-
-    if token in MICROSOFT_CASKS:
-        if os.path.exists(MSUPDATE):
-            safe_print(f'  Running Microsoft updater silently for {app["name"]}...')
-            subprocess.Popen(
-                [MSUPDATE, '--install'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            LOG.info(f'msupdate --install launched for {app["name"]}')
-            return True, 'Updating in background — Microsoft apps will restart when done'
-        # msupdate not available — fall through to normal cask pkg download
 
     if app['source'] in ('App Store', 'Apple'):
         safe_print(f'  Opening App Store updates page...')
