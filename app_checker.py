@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 
-import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal
+import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
 import concurrent.futures
 
@@ -349,15 +349,26 @@ def _install_from_url(url, app_name):
             return _ditto_install(app_src, app_name)
 
         elif is_pkg:
-            # Save PKG to ~/Downloads and open with macOS Installer
-            pkg_name = re.sub(r'[^a-zA-Z0-9._-]', '_', app_name) + '.pkg'
-            pkg_dest = os.path.join(os.path.expanduser('~/Downloads'), pkg_name)
-            pkg_tmp  = dl + '.pkg'
+            pkg_tmp = dl + '.pkg'
             os.rename(dl, pkg_tmp)
-            subprocess.run(['cp', pkg_tmp, pkg_dest], capture_output=True)
-            subprocess.run(['open', pkg_dest])
-            LOG.info(f'PKG installer saved to {pkg_dest}')
-            return True, f'PKG installer saved to ~/Downloads/{pkg_name} — follow the prompts'
+            safe_print(f'  Installing {app_name} (you may see a password prompt)...')
+            LOG.info(f'Running silent pkg install for {app_name}')
+            # Silent install via macOS installer command — one password dialog, no wizard
+            script = f'do shell script "installer -pkg {shlex.quote(pkg_tmp)} -target /" with administrator privileges'
+            r = subprocess.run(['osascript', '-e', script],
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode == 0:
+                LOG.info(f'Silent pkg install succeeded for {app_name}')
+                return True, f'{app_name} installed successfully'
+            else:
+                err = r.stderr.strip() or r.stdout.strip()
+                LOG.warning(f'Silent install failed for {app_name}: {err}')
+                # Fallback: save to Downloads and open wizard
+                pkg_name = re.sub(r'[^a-zA-Z0-9._-]', '_', app_name) + '.pkg'
+                pkg_dest = os.path.join(os.path.expanduser('~/Downloads'), pkg_name)
+                subprocess.run(['cp', pkg_tmp, pkg_dest], capture_output=True)
+                subprocess.run(['open', pkg_dest])
+                return True, f'Saved to ~/Downloads/{pkg_name} — follow the installer prompts'
 
         else:
             LOG.warning(f'Unknown file format for {app_name}: {ft.strip()[:100]}')
