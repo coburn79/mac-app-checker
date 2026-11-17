@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal
 import logging
