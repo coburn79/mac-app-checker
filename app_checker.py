@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
@@ -387,7 +387,7 @@ def _install_from_url(url, app_name):
 
 # ── Update dispatcher ─────────────────────────────────────────────────────────
 def do_update(app):
-    """Trigger an update for the app. Returns (success, message)."""
+    """Trigger an update for the app. Returns (success, message, info=False)."""
     token = app.get('cask_token', '')
     LOG.info(f'Update requested: {app["name"]} (token={token!r}, source={app["source"]})')
 
@@ -400,12 +400,19 @@ def do_update(app):
                                capture_output=True, text=True, timeout=600)
             if r.returncode == 0:
                 LOG.info(f'mas upgrade succeeded for {app["name"]}')
-                return True, f'{app["name"]} updated successfully'
+                return True, f'{app["name"]} updated successfully', False
             LOG.warning(f'mas upgrade failed for {app["name"]}: {r.stderr.strip()}')
-        # Fallback: open App Store updates page
-        safe_print(f'  Opening App Store for {app["name"]}...')
+        # mas not available — explain clearly rather than silently opening App Store
+        if not mas_bin:
+            msg = ('This is a Mac App Store app. To update it: open the App Store '
+                   'and go to the Updates tab. For silent one-click updates in the future, '
+                   'install mas (a free tool) by first installing Homebrew from brew.sh, '
+                   'then running: brew install mas')
+        else:
+            msg = f'mas could not update {app["name"]} — open App Store > Updates tab to install manually'
+        LOG.info(f'App Store fallback for {app["name"]}: mas_bin={mas_bin!r}')
         subprocess.run(['open', 'macappstore://showUpdatesPage'])
-        return True, 'App Store opened — click Update next to the app'
+        return False, msg, True  # info=True → amber info state, not red failure
 
     if not token:
         safe_print(f'  Opening {app["name"]} to self-update...')
@@ -598,6 +605,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .btn-do:disabled{opacity:.5;cursor:default;transform:none;box-shadow:none}
 .btn-do.done{background:var(--ok-bg);color:var(--ok-fg);box-shadow:none}
 .btn-do.failed{background:var(--crit-bg);color:var(--crit-fg);box-shadow:none}
+.btn-do.info{background:var(--upd-bg);color:var(--upd-fg);box-shadow:none;cursor:default;white-space:normal;max-width:260px;height:auto;padding:6px 10px;text-align:left;font-weight:400;font-size:11px;line-height:1.4}
 .btn-store{background:transparent;color:var(--accent);border:1.5px solid var(--accent)}
 .btn-store:hover{background:var(--accent-bg)}
 .btn-visit{background:transparent;color:var(--fg2);border:1px solid var(--border)}
@@ -755,6 +763,13 @@ async function doUpdate(btn,enc){
     if(d.success){
       btn.textContent='✓ Done';btn.title=d.msg||'';
       btn.classList.remove('btn-do');btn.classList.add('done');
+    }else if(d.info){
+      btn.textContent='ℹ️ App Store only';btn.title='';
+      btn.classList.remove('btn-do');btn.classList.add('info');btn.disabled=false;
+      const msgEl=document.createElement('div');
+      msgEl.style.cssText='margin-top:4px;font-size:11px;color:var(--upd-fg);max-width:260px;line-height:1.4;white-space:normal';
+      msgEl.textContent=d.msg||'';
+      btn.parentNode.appendChild(msgEl);
     }else{
       btn.textContent='✕ Failed';btn.title=d.msg||'';
       btn.classList.remove('btn-do');btn.classList.add('failed');btn.disabled=false;
@@ -978,8 +993,11 @@ def serve_dashboard():
                 name   = body.get('name', '')
                 app    = next((a for a in (state['results'] or []) if a['name'] == name), None)
                 if app:
-                    success, msg = do_update(app)
-                    resp = json.dumps({'success': success, 'msg': msg})
+                    result  = do_update(app)
+                    success = result[0]
+                    msg     = result[1]
+                    info    = result[2] if len(result) > 2 else False
+                    resp = json.dumps({'success': success, 'msg': msg, 'info': info})
                 else:
                     resp = json.dumps({'success': False, 'msg': 'App not found'})
             except Exception as e:
