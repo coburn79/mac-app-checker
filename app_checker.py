@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.1.2"
+__version__ = "2.2.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
@@ -121,10 +121,18 @@ def fetch_cask(token):
     return d if d and 'version' in d else None
 
 def fetch_mas(bundle_id):
+    """Returns (version, apple_id_str) or (None, None)."""
     for country in ('us', 'gb'):
         d = fetch_url(f'https://itunes.apple.com/lookup?bundleId={bundle_id}&country={country}')
         if d and d.get('resultCount', 0) > 0:
-            return d['results'][0].get('version')
+            r = d['results'][0]
+            return r.get('version'), str(r.get('trackId', ''))
+    return None, None
+
+def find_mas():
+    for p in ('/opt/homebrew/bin/mas', '/usr/local/bin/mas'):
+        if os.path.exists(p):
+            return p
     return None
 
 # ── App scanning ──────────────────────────────────────────────────────────────
@@ -283,8 +291,11 @@ def _install_from_url(url, app_name):
     with tempfile.TemporaryDirectory() as tmp_dir:
         dl = os.path.join(tmp_dir, 'download')
         LOG.info(f'Downloading {app_name} from {url}')
-        safe_print(f'  Downloading {app_name}...')
-        r = subprocess.run(['curl', '-L', '-s', '-o', dl, url], timeout=600)
+        safe_print(f'  Downloading {app_name} (large files may take a few minutes)...')
+        r = subprocess.run(
+            ['curl', '-L', '-s', '-o', dl, '--retry', '2', '--max-time', '1800', url],
+            timeout=1850
+        )
         if r.returncode != 0 or not os.path.exists(dl):
             LOG.warning(f'Download failed for {app_name}')
             return False, 'Download failed'
@@ -381,9 +392,20 @@ def do_update(app):
     LOG.info(f'Update requested: {app["name"]} (token={token!r}, source={app["source"]})')
 
     if app['source'] in ('App Store', 'Apple'):
-        safe_print(f'  Opening App Store updates page...')
+        apple_id = app.get('apple_id', '')
+        mas_bin  = find_mas()
+        if mas_bin and apple_id:
+            safe_print(f'  Installing {app["name"]} via mas (silent)...')
+            r = subprocess.run([mas_bin, 'upgrade', apple_id],
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode == 0:
+                LOG.info(f'mas upgrade succeeded for {app["name"]}')
+                return True, f'{app["name"]} updated successfully'
+            LOG.warning(f'mas upgrade failed for {app["name"]}: {r.stderr.strip()}')
+        # Fallback: open App Store updates page
+        safe_print(f'  Opening App Store for {app["name"]}...')
         subprocess.run(['open', 'macappstore://showUpdatesPage'])
-        return True, 'App Store opened'
+        return True, 'App Store opened — click Update next to the app'
 
     if not token:
         safe_print(f'  Opening {app["name"]} to self-update...')
@@ -772,7 +794,7 @@ def check_one_app(app):
     if name in HIDE_APP_NAMES or bundle_id in HIDE_BUNDLE_IDS:
         return None
 
-    latest = cask_token = None
+    latest = cask_token = apple_id = None
     homepage = ''
 
     if bundle_id in APPLE_SYSTEM_BUNDLES:
@@ -793,8 +815,8 @@ def check_one_app(app):
             source = 'Direct'
 
     elif is_app_store_app(app['path']):
-        latest   = fetch_mas(bundle_id)
-        homepage = f'https://itunes.apple.com/app?bundleId={bundle_id}'
+        latest, apple_id = fetch_mas(bundle_id)
+        homepage = f'https://apps.apple.com/app/id{apple_id}' if apple_id else f'https://itunes.apple.com/app?bundleId={bundle_id}'
         source   = 'App Store'
 
     else:
@@ -820,6 +842,7 @@ def check_one_app(app):
         'source':     source,
         'homepage':   homepage,
         'cask_token': cask_token or '',
+        'apple_id':   apple_id or '',
     }
 
 def scan_apps(progress_cb=None):
