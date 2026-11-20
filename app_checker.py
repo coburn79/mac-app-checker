@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
 import concurrent.futures
+import xml.etree.ElementTree as ET
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app_checker.log')
@@ -116,6 +117,20 @@ def fetch_url(url, timeout=10):
         pass
     return None
 
+def fetch_url_text(url, timeout=10):
+    """Fetch a URL and return raw text (for XML/HTML feeds)."""
+    try:
+        r = subprocess.run(
+            ['curl', '-s', '--max-time', str(timeout), '-L',
+             '-A', f'MacAppChecker/{__version__}', url],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout
+    except Exception:
+        pass
+    return None
+
 def fetch_cask(token):
     d = fetch_url(f'https://formulae.brew.sh/api/cask/{token}.json')
     return d if d and 'version' in d else None
@@ -135,6 +150,93 @@ def find_mas():
             return p
     return None
 
+# ── Sparkle ───────────────────────────────────────────────────────────────────
+_SPARKLE_NS = {
+    'sparkle': 'http://www.andymatuschak.org/xml-namespaces/sparkle',
+    'dc':      'http://purl.org/dc/elements/1.1/',
+}
+
+def get_sparkle_feed_url(app_path):
+    """Return the SUFeedURL from an app's Info.plist, or None."""
+    plist_path = os.path.join(app_path, 'Contents', 'Info.plist')
+    try:
+        with open(plist_path, 'rb') as f:
+            p = plistlib.load(f)
+        return p.get('SUFeedURL') or p.get('SUFeedURL ')
+    except Exception:
+        return None
+
+def fetch_sparkle(feed_url, timeout=8):
+    """Fetch a Sparkle appcast and return (version, changelog_html) or (None, None)."""
+    text = fetch_url_text(feed_url, timeout=timeout)
+    if not text:
+        return None, None
+    try:
+        root = ET.fromstring(text)
+        channel = root.find('channel')
+        if channel is None:
+            return None, None
+        items = channel.findall('item')
+        best_ver = None
+        best_notes = None
+        for item in items:
+            # Version can be in sparkle:version attribute on <enclosure>, or as element
+            enc = item.find('enclosure')
+            ver = None
+            if enc is not None:
+                ver = enc.get('{http://www.andymatuschak.org/xml-namespaces/sparkle}version') or \
+                      enc.get('{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString')
+            if not ver:
+                sv = item.find('{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString')
+                if sv is not None:
+                    ver = sv.text
+            if not ver:
+                sv = item.find('{http://www.andymatuschak.org/xml-namespaces/sparkle}version')
+                if sv is not None:
+                    ver = sv.text
+            if not ver:
+                continue
+            if best_ver is None or is_newer(best_ver, ver):
+                best_ver = ver
+                # Try release notes
+                rn = item.find('{http://www.andymatuschak.org/xml-namespaces/sparkle}releaseNotesLink')
+                if rn is not None and rn.text:
+                    notes_text = fetch_url_text(rn.text.strip(), timeout=5)
+                    best_notes = notes_text[:2000] if notes_text else None
+                else:
+                    desc = item.find('description')
+                    if desc is not None:
+                        best_notes = (desc.text or '')[:2000]
+        return best_ver, best_notes
+    except Exception:
+        return None, None
+
+# ── Vendor-managed apps ───────────────────────────────────────────────────────
+# Apps that have their own mandatory updaters — we can detect they're outdated
+# via the Homebrew cask or App Store, but cannot silently install them.
+VENDOR_MANAGED_BUNDLES = {
+    # Adobe
+    'com.adobe.Creative-Cloud', 'com.adobe.acc.AdobeCreativeCloud',
+    'com.adobe.illustrator', 'com.adobe.Photoshop', 'com.adobe.InDesign',
+    'com.adobe.Premiere-Pro', 'com.adobe.after-effects', 'com.adobe.Lightroom',
+    'com.adobe.LightroomClassicCC', 'com.adobe.bridge', 'com.adobe.dreamweaver',
+    # Browsers (self-updating)
+    'org.mozilla.firefox', 'com.google.Chrome', 'com.microsoft.edgemac',
+    'com.operasoftware.Opera', 'com.brave.Browser',
+    # Other self-managed
+    'com.getdropbox.dropbox', 'us.zoom.xos', 'com.teamviewer.TeamViewer',
+}
+
+VENDOR_MANAGED_NAME_FRAGMENTS = {
+    'adobe', 'creative cloud',
+}
+
+def is_vendor_managed(bundle_id, name):
+    if bundle_id in VENDOR_MANAGED_BUNDLES:
+        return True
+    name_l = name.lower()
+    return any(frag in name_l for frag in VENDOR_MANAGED_NAME_FRAGMENTS)
+
 # ── App scanning ──────────────────────────────────────────────────────────────
 def is_app_store_app(path):
     return os.path.exists(os.path.join(path, 'Contents', '_MASReceipt', 'receipt'))
@@ -152,6 +254,7 @@ def read_app_info(path):
             'build_version': p.get('CFBundleVersion', ''),
             'bundle_id':     p.get('CFBundleIdentifier', ''),
             'path':          path,
+            'sparkle_url':   p.get('SUFeedURL', ''),
         }
     except Exception:
         return None
@@ -238,6 +341,8 @@ def get_status(app):
     if versions_equal(app['installed'], app['latest']):
         return 'current'
     if is_newer(app['installed'], app['latest']):
+        if app.get('vendor_managed'):
+            return 'vendor'
         try:
             gap = int(clean_ver(app['latest']).split('.')[0]) - int(app['installed'].split('.')[0])
             return 'behind' if gap >= 2 else 'update'
@@ -271,10 +376,35 @@ def _quit_app(name):
                    capture_output=True, timeout=5)
     time.sleep(1)
 
+def _backup_app(dest, app_name):
+    """Copy existing .app to ~/Downloads/AppBackups/ before overwriting. Best-effort."""
+    if not os.path.exists(dest):
+        return
+    try:
+        backup_dir = os.path.expanduser('~/Downloads/AppBackups')
+        os.makedirs(backup_dir, exist_ok=True)
+        # Get current installed version for the backup name
+        plist_path = os.path.join(dest, 'Contents', 'Info.plist')
+        ver = ''
+        try:
+            with open(plist_path, 'rb') as f:
+                p = plistlib.load(f)
+            ver = p.get('CFBundleShortVersionString', '')
+        except Exception:
+            pass
+        bname = re.sub(r'[^a-zA-Z0-9._-]', '_', app_name)
+        suffix = f'_{ver}' if ver else ''
+        backup_path = os.path.join(backup_dir, f'{bname}{suffix}.app')
+        subprocess.run(['ditto', dest, backup_path], capture_output=True)
+        LOG.info(f'Backed up {app_name} v{ver} to {backup_path}')
+    except Exception as e:
+        LOG.warning(f'Backup failed for {app_name}: {e}')
+
 def _ditto_install(src_app, app_name):
     """Copy src_app into /Applications using ditto (preserves macOS metadata)."""
     dest = f'/Applications/{os.path.basename(src_app)}'
     _quit_app(app_name)
+    _backup_app(dest, app_name)
     if os.path.exists(dest):
         r = subprocess.run(['rm', '-rf', dest], capture_output=True)
         if r.returncode != 0:
@@ -413,6 +543,18 @@ def do_update(app):
         LOG.info(f'App Store fallback for {app["name"]}: mas_bin={mas_bin!r}')
         subprocess.run(['open', 'macappstore://showUpdatesPage'])
         return False, msg, True  # info=True → amber info state, not red failure
+
+    if app.get('vendor_managed'):
+        safe_print(f'  Opening {app["name"]} (vendor-managed updater)...')
+        homepage = app.get('homepage', '')
+        if homepage:
+            subprocess.run(['open', homepage])
+            return False, (f'{app["name"]} uses its own built-in updater. '
+                           'Open the app and look for "Check for Updates" in the menu, '
+                           'or visit the developer\'s website.'), True
+        subprocess.run(['open', '-a', app['name']])
+        return False, (f'{app["name"]} uses its own built-in updater. '
+                       'Open the app and check for updates inside it.'), True
 
     if not token:
         safe_print(f'  Opening {app["name"]} to self-update...')
@@ -563,8 +705,9 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .macos-status{font-size:12px;color:var(--fg2)}
 .macos-status.ok{color:var(--ok-fg)}
 .macos-status.upd{color:var(--upd-fg);font-weight:500}
-.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
-@media(max-width:520px){.filters{grid-template-columns:repeat(2,1fr)}}
+.filters{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px}
+@media(max-width:620px){.filters{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:420px){.filters{grid-template-columns:repeat(2,1fr)}}
 .ftile{background:var(--surface);border:2px solid transparent;border-radius:var(--radius);padding:14px 16px;cursor:pointer;transition:border-color .15s,background .15s;user-select:none}
 .ftile:hover{border-color:var(--border)}
 .ftile.active{border-color:var(--accent);background:var(--accent-bg)}
@@ -574,7 +717,11 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .t-upd .ftile-n{color:var(--upd-fg)}
 .t-ok  .ftile-n{color:var(--ok-fg)}
 .t-unk .ftile-n{color:var(--unk-fg)}
-.toolbar{display:flex;justify-content:flex-end;margin-bottom:12px;min-height:34px}
+.t-vnd .ftile-n{color:var(--fg2)}
+.toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;min-height:34px;gap:8px}
+.sort-row{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2)}
+.sort-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:inherit;font-size:11px;font-weight:500;cursor:pointer;transition:all .12s}
+.sort-btn.active{background:var(--accent-bg);color:var(--accent);border-color:var(--accent)}
 .btn-all{padding:8px 20px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s,transform .1s;box-shadow:0 2px 8px rgba(0,87,216,.25)}
 .btn-all:hover{opacity:.9;transform:translateY(-1px)}
 .btn-all:active{transform:none}
@@ -610,7 +757,12 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .btn-store:hover{background:var(--accent-bg)}
 .btn-visit{background:transparent;color:var(--fg2);border:1px solid var(--border)}
 .btn-visit:hover{border-color:var(--fg2);color:var(--fg)}
-.action-col{flex-shrink:0}
+.action-col{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+.changelog-toggle{font-size:10px;color:var(--accent);background:none;border:none;cursor:pointer;font-family:inherit;padding:2px 0;text-decoration:underline;text-underline-offset:2px}
+.changelog-toggle:hover{opacity:.75}
+.changelog-panel{display:none;margin-top:8px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;font-size:11px;color:var(--fg2);line-height:1.6;max-width:340px;white-space:pre-wrap;word-break:break-word}
+.changelog-panel.open{display:block}
+.app-card-wrap{display:flex;flex-direction:column;gap:0}
 .empty-state{text-align:center;padding:52px 24px}
 .empty-icon{font-size:38px;margin-bottom:10px}
 .empty-title{font-weight:600;font-size:16px;color:var(--fg);margin-bottom:5px}
@@ -651,11 +803,13 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
     <div class="empty-title">No apps match this filter</div>
     <div class="empty-desc">Try a different category above.</div>
   </div>
+  <div style="margin-top:28px;text-align:center;font-size:11px;color:var(--fg3)" id="scan-footer"></div>
 </div>
 
 <script>
 const D=__DATA__;
 let currentFilter='all';
+let currentSort='status';
 
 function avatarColor(name){
   let h=0;
@@ -667,27 +821,59 @@ function avatarLetters(name){
   return w.length>=2?(w[0][0]+w[1][0]).toUpperCase():name.slice(0,2).toUpperCase();
 }
 
-const SOURCE_LABELS={'App Store':'Mac App Store','Homebrew Cask':'Web download','Direct':'Web download','Apple':'Built into Mac'};
+const SOURCE_LABELS={'App Store':'Mac App Store','Homebrew Cask':'Web download','Sparkle':'Sparkle feed','Direct':'Web download','Apple':'Built into Mac'};
 function friendlySrc(s){return SOURCE_LABELS[s]||s}
 
 const STATUS={
   update: {cls:'b-upd', label:'Update available', tip:''},
   behind: {cls:'b-crit',label:'Outdated',         tip:'This app is several versions behind'},
+  vendor: {cls:'b-unk', label:'Vendor-managed',   tip:'This app has its own built-in updater'},
   current:{cls:'b-ok',  label:'Up to date',       tip:''},
-  unknown:{cls:'b-unk', label:"Can't check",      tip:"We couldn't find update info for this app"},
+  unknown:{cls:'b-unk', label:"Can\'t check",     tip:"We couldn\'t find update info for this app"},
   system: {cls:'b-sys', label:'Built-in app',     tip:'This app is part of macOS and updates with your Mac'},
 };
 
+const STATUS_ORDER={behind:0,update:1,vendor:2,unknown:3,current:4,system:5};
+
 function cleanVer(v){return v?v.split(',')[0]:''}
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+function formatScanTime(iso){
+  if(!iso)return'';
+  try{
+    const d=new Date(iso);
+    return d.toLocaleString('en-GB',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
+  }catch(e){return iso}
+}
+
+function sortApps(apps){
+  const a=[...apps];
+  if(currentSort==='name') return a.sort((x,y)=>x.name.localeCompare(y.name));
+  if(currentSort==='version') return a.sort((x,y)=>{
+    const xs=STATUS_ORDER[x.status]??99,ys=STATUS_ORDER[y.status]??99;
+    return xs!==ys?xs-ys:x.name.localeCompare(y.name);
+  });
+  // default: status then name
+  return a.sort((x,y)=>{
+    const xs=STATUS_ORDER[x.status]??99,ys=STATUS_ORDER[y.status]??99;
+    return xs!==ys?xs-ys:x.name.localeCompare(y.name);
+  });
+}
+
+function toggleChangelog(id){
+  const p=document.getElementById('cl-'+id);
+  if(p)p.classList.toggle('open');
+}
 
 function render(){
   const apps=D.apps;
   const needsUpd=apps.filter(a=>a.status==='update'||a.status==='behind');
   const upToDate=apps.filter(a=>a.status==='current');
+  const vendor  =apps.filter(a=>a.status==='vendor');
   const cantChk =apps.filter(a=>a.status==='unknown'||a.status==='system');
 
-  const dateStr=new Date().toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'});
-  document.getElementById('sub').textContent=apps.length+' apps checked · '+dateStr;
+  document.getElementById('sub').textContent=apps.length+' apps checked · '+formatScanTime(D.scan_time);
 
   const m=D.macos||{};
   document.getElementById('macos').innerHTML=m.has_update
@@ -695,23 +881,30 @@ function render(){
     :'<div class="macos-icon">🍎</div><div class="macos-info"><div class="macos-name">Your Mac · '+(m.version||'Unknown')+'</div><div class="macos-status ok">'+(m.version?'✓ Your Mac is up to date':'Could not check for Mac updates')+'</div></div>';
 
   const tiles=[
-    {k:'all',cls:'t-all',n:apps.length,    l:'All Apps'},
-    {k:'upd',cls:'t-upd',n:needsUpd.length,l:needsUpd.length===1?'Needs Update':'Need Updating'},
-    {k:'ok', cls:'t-ok', n:upToDate.length,l:'Up to Date'},
-    {k:'unk',cls:'t-unk',n:cantChk.length, l:"Can\'t Check"},
+    {k:'all',cls:'t-all',n:apps.length,     l:'All Apps'},
+    {k:'upd',cls:'t-upd',n:needsUpd.length, l:needsUpd.length===1?'Needs Update':'Need Updating'},
+    {k:'ok', cls:'t-ok', n:upToDate.length, l:'Up to Date'},
+    {k:'vnd',cls:'t-vnd',n:vendor.length,   l:'Vendor Managed'},
+    {k:'unk',cls:'t-unk',n:cantChk.length,  l:"Can\'t Check"},
   ];
   document.getElementById('filters').innerHTML=tiles.map(t=>
     '<div class="ftile '+t.cls+(t.k===currentFilter?' active':'')+'" onclick="setFilter(\''+t.k+'\')">'+
     '<div class="ftile-n">'+t.n+'</div><div class="ftile-l">'+t.l+'</div></div>'
   ).join('');
 
-  document.getElementById('toolbar').innerHTML=needsUpd.length>0
-    ?'<button class="btn-all" id="btn-all" onclick="updateAll()">Update All ('+needsUpd.length+')</button>'
-    :'';
+  const sortBtns=['status','name'].map(s=>
+    '<button class="sort-btn'+(currentSort===s?' active':'')+'" onclick="setSort(\''+s+'\')">'+
+    (s==='status'?'By status':'A–Z')+'</button>'
+  ).join('');
 
-  const fmap={all:null,upd:['update','behind'],ok:['current'],unk:['unknown','system']};
+  document.getElementById('toolbar').innerHTML=
+    '<div class="sort-row"><span>Sort:</span>'+sortBtns+'</div>'+
+    (needsUpd.length>0?'<button class="btn-all" id="btn-all" onclick="updateAll()">Update All ('+needsUpd.length+')</button>':'');
+
+  const fmap={all:null,upd:['update','behind'],ok:['current'],vnd:['vendor'],unk:['unknown','system']};
   const sf=fmap[currentFilter];
-  const rows=sf?apps.filter(a=>sf.includes(a.status)):apps;
+  let rows=sf?apps.filter(a=>sf.includes(a.status)):apps;
+  rows=sortApps(rows);
   const listEl=document.getElementById('app-list');
   const emptyEl=document.getElementById('empty');
 
@@ -719,40 +912,52 @@ function render(){
   emptyEl.style.display='none';
 
   listEl.innerHTML=rows.map(a=>{
-    const id='btn-'+a.name.replace(/[^a-z0-9]/gi,'-');
+    const uid=a.name.replace(/[^a-z0-9]/gi,'-');
+    const id='btn-'+uid;
     const si=STATUS[a.status]||STATUS.unknown;
     const lv=cleanVer(a.latest)||'';
     const isUpd=a.status==='update'||a.status==='behind';
 
     const verHtml=isUpd&&lv
-      ?'<span class="ver-cur">'+a.installed+'</span><span class="ver-arr"> → </span><span class="ver-new">'+lv+'</span>'
-      :'<span class="ver-cur">'+a.installed+'</span>';
+      ?'<span class="ver-cur">'+esc(a.installed)+'</span><span class="ver-arr"> → </span><span class="ver-new">'+esc(lv)+'</span>'
+      :'<span class="ver-cur">'+esc(a.installed)+'</span>';
 
     let actionHtml='';
     if(isUpd){
       actionHtml='<button class="btn-action btn-do" id="'+id+'" onclick="doUpdate(this,\''+encodeURIComponent(a.name)+'\')">Update</button>';
+    }else if(a.status==='vendor'){
+      actionHtml='<button class="btn-action btn-do" id="'+id+'" onclick="doUpdate(this,\''+encodeURIComponent(a.name)+'\')">Open updater</button>';
     }else if(a.status==='system'){
       actionHtml='<button class="btn-action btn-store" onclick="doUpdate(this,\''+encodeURIComponent(a.name)+'\')">Open App Store</button>';
     }else if(a.status==='unknown'&&a.homepage){
-      actionHtml='<a class="btn-action btn-visit" href="'+a.homepage+'" target="_blank" rel="noopener">Get update ↗</a>';
+      actionHtml='<a class="btn-action btn-visit" href="'+esc(a.homepage)+'" target="_blank" rel="noopener">Get update ↗</a>';
     }
 
+    const hasNotes=a.changelog&&a.changelog.trim().length>0;
+    const notesBtn=hasNotes&&isUpd?'<button class="changelog-toggle" onclick="toggleChangelog(\''+uid+'\')">What\'s new ▾</button>':'';
+    const notesPanel=hasNotes&&isUpd?'<div class="changelog-panel" id="cl-'+uid+'">'+esc(a.changelog.trim())+'</div>':'';
+
     const cardCls=a.status==='behind'?' outdated':(isUpd?' needs-update':'');
-    const badgeTip=si.tip?' title="'+si.tip+'"':'';
+    const badgeTip=si.tip?' title="'+esc(si.tip)+'"':'';
 
     return'<div class="app-card'+cardCls+'">'+
-      '<div class="avatar" style="background:'+avatarColor(a.name)+'">'+avatarLetters(a.name)+'</div>'+
+      '<div class="avatar" style="background:'+avatarColor(a.name)+'">'+esc(avatarLetters(a.name))+'</div>'+
       '<div class="app-info">'+
-        '<div class="app-nm">'+a.name+'</div>'+
-        '<div class="app-meta">'+verHtml+'<span class="src-pill">'+friendlySrc(a.source)+'</span></div>'+
+        '<div class="app-nm">'+esc(a.name)+'</div>'+
+        '<div class="app-meta">'+verHtml+'<span class="src-pill">'+esc(friendlySrc(a.source))+'</span></div>'+
+        (notesPanel?notesPanel:'')+
       '</div>'+
       '<div class="badge-col"><span class="badge '+si.cls+'"'+badgeTip+'>'+si.label+'</span></div>'+
-      '<div class="action-col">'+actionHtml+'</div>'+
+      '<div class="action-col">'+actionHtml+(notesBtn||'')+'</div>'+
       '</div>';
   }).join('');
+
+  const foot=document.getElementById('scan-footer');
+  if(foot&&D.scan_time)foot.textContent='Scanned '+formatScanTime(D.scan_time)+' · Mac App Checker v'+D.version;
 }
 
 function setFilter(v){currentFilter=v;render()}
+function setSort(v){currentSort=v;render()}
 
 async function doUpdate(btn,enc){
   const name=decodeURIComponent(enc);
@@ -764,7 +969,7 @@ async function doUpdate(btn,enc){
       btn.textContent='✓ Done';btn.title=d.msg||'';
       btn.classList.remove('btn-do');btn.classList.add('done');
     }else if(d.info){
-      btn.textContent='ℹ️ App Store only';btn.title='';
+      btn.textContent='ℹ️ Info';btn.title='';
       btn.classList.remove('btn-do');btn.classList.add('info');btn.disabled=false;
       const msgEl=document.createElement('div');
       msgEl.style.cssText='margin-top:4px;font-size:11px;color:var(--upd-fg);max-width:260px;line-height:1.4;white-space:normal';
@@ -796,8 +1001,8 @@ render();
 </script>
 </body></html>"""
 
-def build_html(results, macos_info):
-    data = json.dumps({'apps': results, 'macos': macos_info})
+def build_html(results, macos_info, scan_time=None):
+    data = json.dumps({'apps': results, 'macos': macos_info, 'scan_time': scan_time or '', 'version': __version__})
     return HTML_TEMPLATE.replace('__DATA__', data)
 
 # ── App scan: per-app worker ──────────────────────────────────────────────────
@@ -810,7 +1015,9 @@ def check_one_app(app):
         return None
 
     latest = cask_token = apple_id = None
-    homepage = ''
+    homepage  = ''
+    changelog = ''
+    vendor_managed = is_vendor_managed(bundle_id, name)
 
     if bundle_id in APPLE_SYSTEM_BUNDLES:
         source = 'Apple'
@@ -830,7 +1037,14 @@ def check_one_app(app):
             source = 'Direct'
 
     elif is_app_store_app(app['path']):
-        latest, apple_id = fetch_mas(bundle_id)
+        for country in ('us', 'gb'):
+            d = fetch_url(f'https://itunes.apple.com/lookup?bundleId={bundle_id}&country={country}')
+            if d and d.get('resultCount', 0) > 0:
+                r = d['results'][0]
+                latest    = r.get('version')
+                apple_id  = str(r.get('trackId', ''))
+                changelog = (r.get('releaseNotes') or '')[:800]
+                break
         homepage = f'https://apps.apple.com/app/id{apple_id}' if apple_id else f'https://itunes.apple.com/app?bundleId={bundle_id}'
         source   = 'App Store'
 
@@ -843,21 +1057,34 @@ def check_one_app(app):
             source     = 'Homebrew Cask'
             cask_token = token
         else:
-            source   = 'Direct'
+            # Try Sparkle feed as fallback for direct-download indie apps
+            feed_url = app.get('sparkle_url', '')
+            if feed_url:
+                sparkle_ver, sparkle_notes = fetch_sparkle(feed_url)
+                if sparkle_ver:
+                    latest    = sparkle_ver
+                    changelog = (sparkle_notes or '')[:800]
+                    source    = 'Sparkle'
+                else:
+                    source = 'Direct'
+            else:
+                source = 'Direct'
             homepage = HOMEPAGE_OVERRIDES.get(name.lower(), '')
 
-    LOG.info(f'{name}: installed={app["version"]!r}  latest={latest!r}  source={source}')
+    LOG.info(f'{name}: installed={app["version"]!r}  latest={latest!r}  source={source}  vendor_managed={vendor_managed}')
 
     return {
-        'name':       name,
-        'installed':  app['version'],
-        'bundle_id':  bundle_id,
-        'path':       app['path'],
-        'latest':     latest or '',
-        'source':     source,
-        'homepage':   homepage,
-        'cask_token': cask_token or '',
-        'apple_id':   apple_id or '',
+        'name':           name,
+        'installed':      app['version'],
+        'bundle_id':      bundle_id,
+        'path':           app['path'],
+        'latest':         latest or '',
+        'source':         source,
+        'homepage':       homepage,
+        'cask_token':     cask_token or '',
+        'apple_id':       apple_id or '',
+        'changelog':      changelog,
+        'vendor_managed': vendor_managed,
     }
 
 def scan_apps(progress_cb=None):
@@ -904,7 +1131,8 @@ def scan_apps(progress_cb=None):
 
     needs = sum(1 for r in results if r['status'] in ('update', 'behind'))
     LOG.info(f'Scan complete: {len(results)} apps, {needs} need updates')
-    return results, macos_result
+    scan_time = time.strftime('%Y-%m-%dT%H:%M:%S')
+    return results, macos_result, scan_time
 
 # ── HTTP dashboard server ─────────────────────────────────────────────────────
 def serve_dashboard():
@@ -918,13 +1146,14 @@ def serve_dashboard():
         pass
 
     state = {
-        'scanning': True,
-        'done':     0,
-        'total':    0,
-        'current':  'Starting…',
-        'results':  None,
-        'macos':    None,
-        'server':   None,
+        'scanning':  True,
+        'done':      0,
+        'total':     0,
+        'current':   'Starting…',
+        'results':   None,
+        'macos':     None,
+        'scan_time': None,
+        'server':    None,
     }
 
     def on_progress(done, total, app_name):
@@ -933,10 +1162,11 @@ def serve_dashboard():
         state['current'] = app_name
 
     def run_scan():
-        results, macos = scan_apps(progress_cb=on_progress)
-        state['results']  = results
-        state['macos']    = macos
-        state['scanning'] = False
+        results, macos, scan_time = scan_apps(progress_cb=on_progress)
+        state['results']   = results
+        state['macos']     = macos
+        state['scan_time'] = scan_time
+        state['scanning']  = False
 
     scan_thread = threading.Thread(target=run_scan, daemon=True)
 
@@ -970,7 +1200,7 @@ def serve_dashboard():
                 if state['scanning']:
                     self._send(SCANNING_TEMPLATE)
                 else:
-                    self._send(build_html(state['results'], state['macos']))
+                    self._send(build_html(state['results'], state['macos'], state['scan_time']))
             except (BrokenPipeError, OSError):
                 pass
 
@@ -1048,6 +1278,7 @@ def serve_dashboard():
 STATUS_LABEL = {
     'update':  YEL('Update available'),
     'behind':  RED('Far behind'),
+    'vendor':  GRY('Vendor-managed'),
     'current': GRN('Current'),
     'unknown': GRY('Unknown'),
     'system':  GRY('System app'),
@@ -1075,10 +1306,10 @@ def main():
         return
 
     # Terminal and JSON modes still scan synchronously (no progress callback needed)
-    results, macos_info = scan_apps()
+    results, macos_info, scan_time = scan_apps()
 
     if json_mode:
-        print(json.dumps({'macos': macos_info, 'apps': results}, indent=2))
+        print(json.dumps({'macos': macos_info, 'apps': results, 'scan_time': scan_time}, indent=2))
         return
 
     # ── Interactive Terminal mode ─────────────────────────────────────────────
