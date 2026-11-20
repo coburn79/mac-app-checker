@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
@@ -532,29 +532,19 @@ def do_update(app):
                 LOG.info(f'mas upgrade succeeded for {app["name"]}')
                 return True, f'{app["name"]} updated successfully', False
             LOG.warning(f'mas upgrade failed for {app["name"]}: {r.stderr.strip()}')
-        # mas not available — explain clearly rather than silently opening App Store
+        # mas not available — explain clearly, do NOT auto-open App Store
         if not mas_bin:
-            msg = ('This is a Mac App Store app. To update it: open the App Store '
-                   'and go to the Updates tab. For silent one-click updates in the future, '
-                   'install mas (a free tool) by first installing Homebrew from brew.sh, '
-                   'then running: brew install mas')
+            msg = ('Mac App Store app — open App Store > Updates tab to update manually. '
+                   'For silent one-click updates, install Homebrew (brew.sh) then run: brew install mas')
         else:
-            msg = f'mas could not update {app["name"]} — open App Store > Updates tab to install manually'
+            msg = f'mas could not update {app["name"]} — open App Store > Updates tab manually'
         LOG.info(f'App Store fallback for {app["name"]}: mas_bin={mas_bin!r}')
-        subprocess.run(['open', 'macappstore://showUpdatesPage'])
-        return False, msg, True  # info=True → amber info state, not red failure
+        return False, msg, True  # info=True → amber state, nothing opened
 
     if app.get('vendor_managed'):
-        safe_print(f'  Opening {app["name"]} (vendor-managed updater)...')
-        homepage = app.get('homepage', '')
-        if homepage:
-            subprocess.run(['open', homepage])
-            return False, (f'{app["name"]} uses its own built-in updater. '
-                           'Open the app and look for "Check for Updates" in the menu, '
-                           'or visit the developer\'s website.'), True
-        subprocess.run(['open', '-a', app['name']])
-        return False, (f'{app["name"]} uses its own built-in updater. '
-                       'Open the app and check for updates inside it.'), True
+        # Vendor-managed apps are handled client-side (direct link), not via do_update
+        return False, (f'{app["name"]} uses its own built-in updater — '
+                       'open the app and use Help > Check for Updates'), True
 
     if not token:
         safe_print(f'  Opening {app["name"]} to self-update...')
@@ -705,9 +695,8 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .macos-status{font-size:12px;color:var(--fg2)}
 .macos-status.ok{color:var(--ok-fg)}
 .macos-status.upd{color:var(--upd-fg);font-weight:500}
-.filters{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px}
-@media(max-width:620px){.filters{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:420px){.filters{grid-template-columns:repeat(2,1fr)}}
+.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
+@media(max-width:520px){.filters{grid-template-columns:repeat(2,1fr)}}
 .ftile{background:var(--surface);border:2px solid transparent;border-radius:var(--radius);padding:14px 16px;cursor:pointer;transition:border-color .15s,background .15s;user-select:none}
 .ftile:hover{border-color:var(--border)}
 .ftile.active{border-color:var(--accent);background:var(--accent-bg)}
@@ -717,7 +706,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .t-upd .ftile-n{color:var(--upd-fg)}
 .t-ok  .ftile-n{color:var(--ok-fg)}
 .t-unk .ftile-n{color:var(--unk-fg)}
-.t-vnd .ftile-n{color:var(--fg2)}
 .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;min-height:34px;gap:8px}
 .sort-row{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2)}
 .sort-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--fg2);font-family:inherit;font-size:11px;font-weight:500;cursor:pointer;transition:all .12s}
@@ -811,6 +799,8 @@ const D=__DATA__;
 let currentFilter='all';
 let currentSort='status';
 
+const _SORT={behind:0,update:1,vendor:2,unknown:3,current:4,system:5};
+
 function avatarColor(name){
   let h=0;
   for(let i=0;i<name.length;i++)h=name.charCodeAt(i)+((h<<5)-h);
@@ -821,23 +811,20 @@ function avatarLetters(name){
   return w.length>=2?(w[0][0]+w[1][0]).toUpperCase():name.slice(0,2).toUpperCase();
 }
 
-const SOURCE_LABELS={'App Store':'Mac App Store','Homebrew Cask':'Web download','Sparkle':'Sparkle feed','Direct':'Web download','Apple':'Built into Mac'};
+const SOURCE_LABELS={'App Store':'App Store','Homebrew Cask':'Homebrew','Sparkle':'Sparkle','Direct':'Direct','Apple':'Built-in'};
 function friendlySrc(s){return SOURCE_LABELS[s]||s}
 
 const STATUS={
-  update: {cls:'b-upd', label:'Update available', tip:''},
-  behind: {cls:'b-crit',label:'Outdated',         tip:'This app is several versions behind'},
-  vendor: {cls:'b-unk', label:'Vendor-managed',   tip:'This app has its own built-in updater'},
-  current:{cls:'b-ok',  label:'Up to date',       tip:''},
-  unknown:{cls:'b-unk', label:"Can\'t check",     tip:"We couldn\'t find update info for this app"},
-  system: {cls:'b-sys', label:'Built-in app',     tip:'This app is part of macOS and updates with your Mac'},
+  update: {cls:'b-upd', label:'Update available'},
+  behind: {cls:'b-crit',label:'Far behind'},
+  vendor: {cls:'b-unk', label:'Self-updating'},
+  current:{cls:'b-ok',  label:'Up to date'},
+  unknown:{cls:'b-unk', label:"Can\'t check"},
+  system: {cls:'b-sys', label:'Built-in'},
 };
 
-const STATUS_ORDER={behind:0,update:1,vendor:2,unknown:3,current:4,system:5};
-
 function cleanVer(v){return v?v.split(',')[0]:''}
-
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
 function formatScanTime(iso){
   if(!iso)return'';
@@ -847,44 +834,38 @@ function formatScanTime(iso){
   }catch(e){return iso}
 }
 
-function sortApps(apps){
+function sortedApps(apps){
   const a=[...apps];
   if(currentSort==='name') return a.sort((x,y)=>x.name.localeCompare(y.name));
-  if(currentSort==='version') return a.sort((x,y)=>{
-    const xs=STATUS_ORDER[x.status]??99,ys=STATUS_ORDER[y.status]??99;
-    return xs!==ys?xs-ys:x.name.localeCompare(y.name);
-  });
-  // default: status then name
   return a.sort((x,y)=>{
-    const xs=STATUS_ORDER[x.status]??99,ys=STATUS_ORDER[y.status]??99;
-    return xs!==ys?xs-ys:x.name.localeCompare(y.name);
+    const xs=_SORT[x.status]??9, ys=_SORT[y.status]??9;
+    return xs!==ys ? xs-ys : x.name.localeCompare(y.name);
   });
 }
 
-function toggleChangelog(id){
-  const p=document.getElementById('cl-'+id);
-  if(p)p.classList.toggle('open');
+function toggleChangelog(uid){
+  const p=document.getElementById('cl-'+uid);
+  if(p){p.classList.toggle('open');const b=document.getElementById('clb-'+uid);if(b)b.textContent=p.classList.contains('open')?'Hide notes ▴':'What\'s new ▾';}
 }
 
 function render(){
   const apps=D.apps;
-  const needsUpd=apps.filter(a=>a.status==='update'||a.status==='behind');
+  // vendor counts as "needs action" for the tile and filter
+  const needsUpd=apps.filter(a=>a.status==='update'||a.status==='behind'||a.status==='vendor');
   const upToDate=apps.filter(a=>a.status==='current');
-  const vendor  =apps.filter(a=>a.status==='vendor');
   const cantChk =apps.filter(a=>a.status==='unknown'||a.status==='system');
 
-  document.getElementById('sub').textContent=apps.length+' apps checked · '+formatScanTime(D.scan_time);
+  document.getElementById('sub').textContent=apps.length+' apps · '+formatScanTime(D.scan_time);
 
   const m=D.macos||{};
   document.getElementById('macos').innerHTML=m.has_update
     ?'<div class="macos-icon">🍎</div><div class="macos-info"><div class="macos-name">Your Mac · '+(m.version||'')+'</div><div class="macos-status upd">macOS update available: '+(m.updates||[]).slice(0,2).join(', ')+'</div></div>'
-    :'<div class="macos-icon">🍎</div><div class="macos-info"><div class="macos-name">Your Mac · '+(m.version||'Unknown')+'</div><div class="macos-status ok">'+(m.version?'✓ Your Mac is up to date':'Could not check for Mac updates')+'</div></div>';
+    :'<div class="macos-icon">🍎</div><div class="macos-info"><div class="macos-name">Your Mac · '+(m.version||'Unknown')+'</div><div class="macos-status ok">'+(m.version?'✓ Up to date':'Could not check')+'</div></div>';
 
   const tiles=[
     {k:'all',cls:'t-all',n:apps.length,     l:'All Apps'},
-    {k:'upd',cls:'t-upd',n:needsUpd.length, l:needsUpd.length===1?'Needs Update':'Need Updating'},
+    {k:'upd',cls:'t-upd',n:needsUpd.length, l:needsUpd.length===1?'Needs Attention':'Need Attention'},
     {k:'ok', cls:'t-ok', n:upToDate.length, l:'Up to Date'},
-    {k:'vnd',cls:'t-vnd',n:vendor.length,   l:'Vendor Managed'},
     {k:'unk',cls:'t-unk',n:cantChk.length,  l:"Can\'t Check"},
   ];
   document.getElementById('filters').innerHTML=tiles.map(t=>
@@ -893,18 +874,16 @@ function render(){
   ).join('');
 
   const sortBtns=['status','name'].map(s=>
-    '<button class="sort-btn'+(currentSort===s?' active':'')+'" onclick="setSort(\''+s+'\')">'+
-    (s==='status'?'By status':'A–Z')+'</button>'
+    '<button class="sort-btn'+(currentSort===s?' active':'')+'" onclick="setSort(\''+s+'\')">'+(s==='status'?'By status':'A–Z')+'</button>'
   ).join('');
-
+  const autoUpdatable=needsUpd.filter(a=>a.status==='update'||a.status==='behind');
   document.getElementById('toolbar').innerHTML=
     '<div class="sort-row"><span>Sort:</span>'+sortBtns+'</div>'+
-    (needsUpd.length>0?'<button class="btn-all" id="btn-all" onclick="updateAll()">Update All ('+needsUpd.length+')</button>':'');
+    (autoUpdatable.length>0?'<button class="btn-all" id="btn-all" onclick="updateAll()">Update All ('+autoUpdatable.length+')</button>':'');
 
-  const fmap={all:null,upd:['update','behind'],ok:['current'],vnd:['vendor'],unk:['unknown','system']};
+  const fmap={all:null,upd:['update','behind','vendor'],ok:['current'],unk:['unknown','system']};
   const sf=fmap[currentFilter];
-  let rows=sf?apps.filter(a=>sf.includes(a.status)):apps;
-  rows=sortApps(rows);
+  const rows=sortedApps(sf ? apps.filter(a=>sf.includes(a.status)) : apps);
   const listEl=document.getElementById('app-list');
   const emptyEl=document.getElementById('empty');
 
@@ -916,44 +895,45 @@ function render(){
     const id='btn-'+uid;
     const si=STATUS[a.status]||STATUS.unknown;
     const lv=cleanVer(a.latest)||'';
-    const isUpd=a.status==='update'||a.status==='behind';
+    const isAutoUpd=a.status==='update'||a.status==='behind';
+    const isVendor=a.status==='vendor';
 
-    const verHtml=isUpd&&lv
+    const verHtml=(isAutoUpd||isVendor)&&lv
       ?'<span class="ver-cur">'+esc(a.installed)+'</span><span class="ver-arr"> → </span><span class="ver-new">'+esc(lv)+'</span>'
       :'<span class="ver-cur">'+esc(a.installed)+'</span>';
 
     let actionHtml='';
-    if(isUpd){
+    if(isAutoUpd){
       actionHtml='<button class="btn-action btn-do" id="'+id+'" onclick="doUpdate(this,\''+encodeURIComponent(a.name)+'\')">Update</button>';
-    }else if(a.status==='vendor'){
-      actionHtml='<button class="btn-action btn-do" id="'+id+'" onclick="doUpdate(this,\''+encodeURIComponent(a.name)+'\')">Open updater</button>';
+    }else if(isVendor&&a.homepage){
+      actionHtml='<a class="btn-action btn-visit" href="'+esc(a.homepage)+'" target="_blank" rel="noopener">Website ↗</a>';
     }else if(a.status==='system'){
-      actionHtml='<button class="btn-action btn-store" onclick="doUpdate(this,\''+encodeURIComponent(a.name)+'\')">Open App Store</button>';
+      actionHtml='<a class="btn-action btn-store" href="macappstore://showUpdatesPage" target="_blank">App Store ↗</a>';
     }else if(a.status==='unknown'&&a.homepage){
-      actionHtml='<a class="btn-action btn-visit" href="'+esc(a.homepage)+'" target="_blank" rel="noopener">Get update ↗</a>';
+      actionHtml='<a class="btn-action btn-visit" href="'+esc(a.homepage)+'" target="_blank" rel="noopener">Website ↗</a>';
     }
 
-    const hasNotes=a.changelog&&a.changelog.trim().length>0;
-    const notesBtn=hasNotes&&isUpd?'<button class="changelog-toggle" onclick="toggleChangelog(\''+uid+'\')">What\'s new ▾</button>':'';
-    const notesPanel=hasNotes&&isUpd?'<div class="changelog-panel" id="cl-'+uid+'">'+esc(a.changelog.trim())+'</div>':'';
+    // Changelog: show toggle only for auto-updatable apps with notes
+    const hasNotes=a.changelog&&a.changelog.trim().length>0&&isAutoUpd;
+    const notesToggle=hasNotes?'<button class="changelog-toggle" id="clb-'+uid+'" onclick="toggleChangelog(\''+uid+'\')">What\'s new ▾</button>':'';
+    const notesPanel=hasNotes?'<div class="changelog-panel" id="cl-'+uid+'">'+esc(a.changelog.trim())+'</div>':'';
 
-    const cardCls=a.status==='behind'?' outdated':(isUpd?' needs-update':'');
-    const badgeTip=si.tip?' title="'+esc(si.tip)+'"':'';
+    const cardCls=a.status==='behind'?' outdated':(isAutoUpd?' needs-update':isVendor?' needs-update':'');
 
     return'<div class="app-card'+cardCls+'">'+
       '<div class="avatar" style="background:'+avatarColor(a.name)+'">'+esc(avatarLetters(a.name))+'</div>'+
       '<div class="app-info">'+
         '<div class="app-nm">'+esc(a.name)+'</div>'+
-        '<div class="app-meta">'+verHtml+'<span class="src-pill">'+esc(friendlySrc(a.source))+'</span></div>'+
-        (notesPanel?notesPanel:'')+
+        '<div class="app-meta">'+verHtml+'<span class="src-pill">'+esc(friendlySrc(a.source))+'</span>'+(isVendor?'<span class="src-pill" title="This app updates itself">self-updating</span>':'')+'</div>'+
+        (notesPanel||'')+
       '</div>'+
-      '<div class="badge-col"><span class="badge '+si.cls+'"'+badgeTip+'>'+si.label+'</span></div>'+
-      '<div class="action-col">'+actionHtml+(notesBtn||'')+'</div>'+
+      '<div class="badge-col"><span class="badge '+si.cls+'">'+si.label+'</span></div>'+
+      '<div class="action-col">'+actionHtml+(notesToggle?'<br>'+notesToggle:'')+'</div>'+
       '</div>';
   }).join('');
 
   const foot=document.getElementById('scan-footer');
-  if(foot&&D.scan_time)foot.textContent='Scanned '+formatScanTime(D.scan_time)+' · Mac App Checker v'+D.version;
+  if(foot)foot.textContent=D.scan_time?'Scanned '+formatScanTime(D.scan_time)+' · v'+D.version:'v'+D.version;
 }
 
 function setFilter(v){currentFilter=v;render()}
@@ -971,10 +951,13 @@ async function doUpdate(btn,enc){
     }else if(d.info){
       btn.textContent='ℹ️ Info';btn.title='';
       btn.classList.remove('btn-do');btn.classList.add('info');btn.disabled=false;
-      const msgEl=document.createElement('div');
-      msgEl.style.cssText='margin-top:4px;font-size:11px;color:var(--upd-fg);max-width:260px;line-height:1.4;white-space:normal';
-      msgEl.textContent=d.msg||'';
-      btn.parentNode.appendChild(msgEl);
+      if(!btn.nextElementSibling||btn.nextElementSibling.className!=='info-msg'){
+        const msgEl=document.createElement('div');
+        msgEl.className='info-msg';
+        msgEl.style.cssText='margin-top:4px;font-size:11px;color:var(--upd-fg);max-width:240px;line-height:1.4;white-space:normal';
+        msgEl.textContent=d.msg||'';
+        btn.parentNode.insertBefore(msgEl,btn.nextSibling);
+      }
     }else{
       btn.textContent='✕ Failed';btn.title=d.msg||'';
       btn.classList.remove('btn-do');btn.classList.add('failed');btn.disabled=false;
@@ -1127,7 +1110,8 @@ def scan_apps(progress_cb=None):
     macos_thread.join(timeout=40)
     for r in results:
         r['status'] = get_status(r)
-    results.sort(key=lambda x: (x['status'] not in ('update', 'behind'), x['name'].lower()))
+    _SORT_ORDER = {'behind': 0, 'update': 1, 'vendor': 2, 'unknown': 3, 'current': 4, 'system': 5}
+    results.sort(key=lambda x: (_SORT_ORDER.get(x['status'], 9), x['name'].lower()))
 
     needs = sum(1 for r in results if r['status'] in ('update', 'behind'))
     LOG.info(f'Scan complete: {len(results)} apps, {needs} need updates')
