@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.3.1"
+__version__ = "2.3.2"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
@@ -180,20 +180,23 @@ def fetch_sparkle(feed_url, timeout=8):
         best_ver = None
         best_notes = None
         for item in items:
-            # Version can be in sparkle:version attribute on <enclosure>, or as element
+            NS = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
             enc = item.find('enclosure')
             ver = None
-            if enc is not None:
-                ver = enc.get('{http://www.andymatuschak.org/xml-namespaces/sparkle}version') or \
-                      enc.get('{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString')
+            # Prefer shortVersionString (human-readable) over version (build number)
+            # Check item child elements first (most apps), then enclosure attributes
+            for tag in (f'{{{NS}}}shortVersionString', f'{{{NS}}}version'):
+                sv = item.find(tag)
+                if sv is not None and sv.text:
+                    ver = sv.text.strip()
+                    break
+            if not ver and enc is not None:
+                ver = enc.get(f'{{{NS}}}shortVersionString') or enc.get(f'{{{NS}}}version')
             if not ver:
-                sv = item.find('{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString')
-                if sv is not None:
-                    ver = sv.text
-            if not ver:
-                sv = item.find('{http://www.andymatuschak.org/xml-namespaces/sparkle}version')
-                if sv is not None:
-                    ver = sv.text
+                # Last resort: try title if it looks like a version
+                title = (item.findtext('title') or '').strip()
+                if re.match(r'^\d+[\.\d]+$', title):
+                    ver = title
             if not ver:
                 continue
             if best_ver is None or is_newer(best_ver, ver):
@@ -1023,13 +1026,30 @@ def check_one_app(app):
         for country in ('us', 'gb'):
             d = fetch_url(f'https://itunes.apple.com/lookup?bundleId={bundle_id}&country={country}')
             if d and d.get('resultCount', 0) > 0:
-                r = d['results'][0]
+                # Prefer mac-software entries; skip iOS-only entries (Catalyst apps share
+                # a bundle ID but the iOS version number is completely different)
+                mac_result = next((r for r in d['results'] if r.get('kind') == 'mac-software'), None)
+                r = mac_result or d['results'][0]
+                if r.get('kind') == 'software' and not mac_result:
+                    # iOS-only result — version is untrustworthy for Mac, skip iTunes
+                    break
                 latest    = r.get('version')
                 apple_id  = str(r.get('trackId', ''))
                 changelog = (r.get('releaseNotes') or '')[:800]
                 break
+        # If iTunes gave no usable Mac version, try Sparkle (Catalyst apps often have one)
+        if not latest:
+            feed_url = app.get('sparkle_url', '')
+            if feed_url:
+                sparkle_ver, sparkle_notes = fetch_sparkle(feed_url)
+                if sparkle_ver:
+                    latest    = sparkle_ver
+                    changelog = (sparkle_notes or '')[:800]
+                    source    = 'Sparkle'
+                    LOG.info(f'{name}: iTunes returned iOS version; using Sparkle {sparkle_ver!r}')
+        if source != 'Sparkle':
+            source = 'App Store'
         homepage = f'https://apps.apple.com/app/id{apple_id}' if apple_id else f'https://itunes.apple.com/app?bundleId={bundle_id}'
-        source   = 'App Store'
 
     else:
         token = normalize_to_token(name)
