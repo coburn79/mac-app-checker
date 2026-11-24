@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.3.2"
+__version__ = "2.3.3"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
@@ -524,7 +524,7 @@ def do_update(app):
     token = app.get('cask_token', '')
     LOG.info(f'Update requested: {app["name"]} (token={token!r}, source={app["source"]})')
 
-    if app['source'] in ('App Store', 'Apple'):
+    if app.get('mas_app') or app['source'] in ('App Store', 'Apple'):
         apple_id = app.get('apple_id', '')
         mas_bin  = find_mas()
         if mas_bin and apple_id:
@@ -1003,6 +1003,7 @@ def check_one_app(app):
     latest = cask_token = apple_id = None
     homepage  = ''
     changelog = ''
+    mas_app = False
     vendor_managed = is_vendor_managed(bundle_id, name)
 
     if bundle_id in APPLE_SYSTEM_BUNDLES:
@@ -1050,6 +1051,8 @@ def check_one_app(app):
         if source != 'Sparkle':
             source = 'App Store'
         homepage = f'https://apps.apple.com/app/id{apple_id}' if apple_id else f'https://itunes.apple.com/app?bundleId={bundle_id}'
+        # Always flag as App Store for update purposes, regardless of version-detection source
+        mas_app = True
 
     else:
         token = normalize_to_token(name)
@@ -1088,6 +1091,7 @@ def check_one_app(app):
         'apple_id':       apple_id or '',
         'changelog':      changelog,
         'vendor_managed': vendor_managed,
+        'mas_app':        mas_app,
     }
 
 def scan_apps(progress_cb=None):
