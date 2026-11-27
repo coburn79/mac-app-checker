@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
@@ -838,7 +838,7 @@ function render(){
   const upToDate=apps.filter(a=>a.status==='current');
   const cantChk =apps.filter(a=>a.status==='unknown'||a.status==='system');
 
-  document.getElementById('sub').textContent=apps.length+' apps · '+formatScanTime(D.scan_time);
+  document.getElementById('sub').textContent='v'+D.version+' · '+apps.length+' apps · '+formatScanTime(D.scan_time);
 
   const m=D.macos||{};
   document.getElementById('macos').innerHTML=m.has_update
@@ -931,9 +931,22 @@ async function doUpdate(btn,enc){
     if(d.success){
       btn.textContent='✓ Done';btn.title=d.msg||'';
       btn.classList.remove('btn-do');btn.classList.add('done');
-      // Show new version in the row
       const card=btn.closest('.app-card');
-      if(card){const vc=card.querySelector('.ver-cur');if(vc){vc.textContent=D.apps.find(a=>a.name===name)?.latest||vc.textContent;}}
+      if(card){
+        // Update displayed installed version to the new version
+        const appData=D.apps.find(a=>a.name===name);
+        const newVer=appData?.latest||'';
+        const vc=card.querySelector('.ver-cur');
+        if(vc&&newVer)vc.textContent=newVer.split(',')[0];
+        // Flip badge to green "Current"
+        const badge=card.querySelector('.badge');
+        if(badge){badge.className='badge b-ok';badge.textContent='Current';}
+        // Update in-memory status so tile counts stay accurate on next render
+        if(appData){appData.status='current';if(newVer)appData.installed=newVer.split(',')[0];}
+        // Hide the arrow + old version if shown
+        const arrow=card.querySelector('.ver-arr');if(arrow)arrow.style.display='none';
+        const verNew=card.querySelector('.ver-new');if(verNew)verNew.style.display='none';
+      }
     }else if(d.info){
       btn.textContent='ℹ️ Info';btn.title='';
       btn.classList.remove('btn-do');btn.classList.add('info');btn.disabled=false;
