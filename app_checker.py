@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """Mac App Checker - scans /Applications and checks for updates"""
 
-__version__ = "2.3.3"
+__version__ = "2.4.0"
 
 import os, plistlib, json, subprocess, time, re, sys, tempfile, threading, signal, shlex
 import logging
+import logging.handlers
 import concurrent.futures
 import xml.etree.ElementTree as ET
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app_checker.log')
-logging.basicConfig(
-    filename=_LOG_PATH,
-    level=logging.INFO,
-    format='%(asctime)s  %(levelname)-7s  %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
+_log_handler = logging.handlers.RotatingFileHandler(
+    _LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2
 )
+_log_handler.setFormatter(logging.Formatter(
+    '%(asctime)s  %(levelname)-7s  %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
+))
+logging.getLogger().addHandler(_log_handler)
+logging.getLogger().setLevel(logging.INFO)
 LOG = logging.getLogger('mac_app_checker')
 
 # ── Colour helpers (terminal mode only) ──────────────────────────────────────
@@ -82,11 +85,6 @@ CASK_OVERRIDES = {
     'handbrake': 'handbrake', 'imageoptim': 'imageoptim',
 }
 
-MICROSOFT_CASKS = {
-    'microsoft-word', 'microsoft-excel', 'microsoft-powerpoint',
-    'microsoft-onenote', 'microsoft-outlook', 'microsoft-teams', 'microsoft-edge',
-}
-MICROSOFT_AUTOUPDATE = '/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app'
 MICROSOFT_BUNDLE_PREFIX = 'com.microsoft.'
 
 APPLE_SYSTEM_BUNDLES = {
@@ -135,15 +133,6 @@ def fetch_cask(token):
     d = fetch_url(f'https://formulae.brew.sh/api/cask/{token}.json')
     return d if d and 'version' in d else None
 
-def fetch_mas(bundle_id):
-    """Returns (version, apple_id_str) or (None, None)."""
-    for country in ('us', 'gb'):
-        d = fetch_url(f'https://itunes.apple.com/lookup?bundleId={bundle_id}&country={country}')
-        if d and d.get('resultCount', 0) > 0:
-            r = d['results'][0]
-            return r.get('version'), str(r.get('trackId', ''))
-    return None, None
-
 def find_mas():
     for p in ('/opt/homebrew/bin/mas', '/usr/local/bin/mas'):
         if os.path.exists(p):
@@ -151,21 +140,6 @@ def find_mas():
     return None
 
 # ── Sparkle ───────────────────────────────────────────────────────────────────
-_SPARKLE_NS = {
-    'sparkle': 'http://www.andymatuschak.org/xml-namespaces/sparkle',
-    'dc':      'http://purl.org/dc/elements/1.1/',
-}
-
-def get_sparkle_feed_url(app_path):
-    """Return the SUFeedURL from an app's Info.plist, or None."""
-    plist_path = os.path.join(app_path, 'Contents', 'Info.plist')
-    try:
-        with open(plist_path, 'rb') as f:
-            p = plistlib.load(f)
-        return p.get('SUFeedURL') or p.get('SUFeedURL ')
-    except Exception:
-        return None
-
 def fetch_sparkle(feed_url, timeout=8):
     """Fetch a Sparkle appcast and return (version, changelog_html) or (None, None)."""
     text = fetch_url_text(feed_url, timeout=timeout)
@@ -177,14 +151,13 @@ def fetch_sparkle(feed_url, timeout=8):
         if channel is None:
             return None, None
         items = channel.findall('item')
+        NS = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
         best_ver = None
-        best_notes = None
+        best_item = None
         for item in items:
-            NS = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
             enc = item.find('enclosure')
             ver = None
             # Prefer shortVersionString (human-readable) over version (build number)
-            # Check item child elements first (most apps), then enclosure attributes
             for tag in (f'{{{NS}}}shortVersionString', f'{{{NS}}}version'):
                 sv = item.find(tag)
                 if sv is not None and sv.text:
@@ -193,7 +166,6 @@ def fetch_sparkle(feed_url, timeout=8):
             if not ver and enc is not None:
                 ver = enc.get(f'{{{NS}}}shortVersionString') or enc.get(f'{{{NS}}}version')
             if not ver:
-                # Last resort: try title if it looks like a version
                 title = (item.findtext('title') or '').strip()
                 if re.match(r'^\d+[\.\d]+$', title):
                     ver = title
@@ -201,15 +173,19 @@ def fetch_sparkle(feed_url, timeout=8):
                 continue
             if best_ver is None or is_newer(best_ver, ver):
                 best_ver = ver
-                # Try release notes
-                rn = item.find('{http://www.andymatuschak.org/xml-namespaces/sparkle}releaseNotesLink')
-                if rn is not None and rn.text:
-                    notes_text = fetch_url_text(rn.text.strip(), timeout=5)
-                    best_notes = notes_text[:2000] if notes_text else None
-                else:
-                    desc = item.find('description')
-                    if desc is not None:
-                        best_notes = (desc.text or '')[:2000]
+                best_item = item
+        # Fetch release notes only once, for the winning item
+        best_notes = None
+        if best_item is not None:
+            rn = best_item.find(f'{{{NS}}}releaseNotesLink')
+            if rn is not None and rn.text:
+                notes_text = fetch_url_text(rn.text.strip(), timeout=5)
+                if notes_text:
+                    best_notes = re.sub(r'<[^>]+>', '', notes_text)[:2000]
+            else:
+                desc = best_item.find('description')
+                if desc is not None:
+                    best_notes = re.sub(r'<[^>]+>', '', desc.text or '')[:2000]
         return best_ver, best_notes
     except Exception:
         return None, None
@@ -375,7 +351,8 @@ def check_macos():
 
 # ── Installer helpers ─────────────────────────────────────────────────────────
 def _quit_app(name):
-    subprocess.run(['osascript', '-e', f'tell application "{name}" to quit'],
+    safe_name = name.replace('"', '\\"')
+    subprocess.run(['osascript', '-e', f'tell application "{safe_name}" to quit'],
                    capture_output=True, timeout=5)
     time.sleep(1)
 
@@ -507,12 +484,13 @@ def _install_from_url(url, app_name):
             else:
                 err = r.stderr.strip() or r.stdout.strip()
                 LOG.warning(f'Silent install failed for {app_name}: {err}')
-                # Fallback: save to Downloads and open wizard
+                # Fallback: save to Downloads for manual install
                 pkg_name = re.sub(r'[^a-zA-Z0-9._-]', '_', app_name) + '.pkg'
                 pkg_dest = os.path.join(os.path.expanduser('~/Downloads'), pkg_name)
                 subprocess.run(['cp', pkg_tmp, pkg_dest], capture_output=True)
-                subprocess.run(['open', pkg_dest])
-                return True, f'Saved to ~/Downloads/{pkg_name} — follow the installer prompts'
+                msg = f'Saved to ~/Downloads/{pkg_name} — open it to run the installer'
+                LOG.info(f'PKG saved for manual install: {pkg_dest}')
+                return False, msg, True  # info=True → amber state
 
         else:
             LOG.warning(f'Unknown file format for {app_name}: {ft.strip()[:100]}')
@@ -753,7 +731,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .changelog-toggle:hover{opacity:.75}
 .changelog-panel{display:none;margin-top:8px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;font-size:11px;color:var(--fg2);line-height:1.6;max-width:340px;white-space:pre-wrap;word-break:break-word}
 .changelog-panel.open{display:block}
-.app-card-wrap{display:flex;flex-direction:column;gap:0}
 .empty-state{text-align:center;padding:52px 24px}
 .empty-icon{font-size:38px;margin-bottom:10px}
 .empty-title{font-weight:600;font-size:16px;color:var(--fg);margin-bottom:5px}
@@ -769,7 +746,10 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
     <span class="brand-name">Mac App Checker</span>
     <span class="brand-sub" id="sub">Checking your apps…</span>
   </div>
-  <button class="btn-quit" onclick="document.getElementById('quit-modal').classList.add('open')">Quit</button>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button class="btn-quit" onclick="location.href='/'">Rescan</button>
+    <button class="btn-quit" onclick="document.getElementById('quit-modal').classList.add('open')">Quit</button>
+  </div>
 </div>
 
 <div class="modal-backdrop" id="quit-modal">
@@ -894,7 +874,7 @@ function render(){
   emptyEl.style.display='none';
 
   listEl.innerHTML=rows.map(a=>{
-    const uid=a.name.replace(/[^a-z0-9]/gi,'-');
+    const uid=(a.bundle_id||a.name).replace(/[^a-z0-9]/gi,'-');
     const id='btn-'+uid;
     const si=STATUS[a.status]||STATUS.unknown;
     const lv=cleanVer(a.latest)||'';
@@ -951,6 +931,9 @@ async function doUpdate(btn,enc){
     if(d.success){
       btn.textContent='✓ Done';btn.title=d.msg||'';
       btn.classList.remove('btn-do');btn.classList.add('done');
+      // Show new version in the row
+      const card=btn.closest('.app-card');
+      if(card){const vc=card.querySelector('.ver-cur');if(vc){vc.textContent=D.apps.find(a=>a.name===name)?.latest||vc.textContent;}}
     }else if(d.info){
       btn.textContent='ℹ️ Info';btn.title='';
       btn.classList.remove('btn-do');btn.classList.add('info');btn.disabled=false;
@@ -976,11 +959,17 @@ async function updateAll(){
   if(!btn)return;
   btn.disabled=true;btn.textContent='Updating…';
   const apps=D.apps.filter(a=>a.status==='update'||a.status==='behind');
+  let failed=0;
   for(const a of apps){
-    const b=document.getElementById('btn-'+a.name.replace(/[^a-z0-9]/gi,'-'));
-    if(b&&!b.classList.contains('done'))await doUpdate(b,encodeURIComponent(a.name));
+    const uid=(a.bundle_id||a.name).replace(/[^a-z0-9]/gi,'-');
+    const b=document.getElementById('btn-'+uid);
+    if(b&&!b.classList.contains('done')){
+      await doUpdate(b,encodeURIComponent(a.name));
+      if(b.classList.contains('failed'))failed++;
+    }
   }
-  btn.textContent='All done ✓';
+  btn.textContent=failed>0?failed+' failed — see above':'All done ✓';
+  btn.disabled=false;
 }
 
 render();
@@ -1036,7 +1025,8 @@ def check_one_app(app):
                     break
                 latest    = r.get('version')
                 apple_id  = str(r.get('trackId', ''))
-                changelog = (r.get('releaseNotes') or '')[:800]
+                raw_notes = r.get('releaseNotes') or ''
+                changelog = re.sub(r'<[^>]+>', '', raw_notes)[:800]
                 break
         # If iTunes gave no usable Mac version, try Sparkle (Catalyst apps often have one)
         if not latest:
@@ -1128,7 +1118,7 @@ def scan_apps(progress_cb=None):
         if progress_cb:
             progress_cb(n, total, app['name'])
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         list(executor.map(_check, apps))
 
     macos_thread.join(timeout=40)
@@ -1244,7 +1234,6 @@ def serve_dashboard():
             try:
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(resp.encode())
             except (BrokenPipeError, OSError):
@@ -1387,7 +1376,8 @@ def main():
     for app in to_update:
         cv = clean_ver(app.get('latest', ''))
         print(f"\n{BLD('Updating')} {app['name']}  {GRY(app['installed'])} → {GRN(cv)}")
-        success, msg = do_update(app)
+        result = do_update(app)
+        success, msg = result[0], result[1]
         if success:
             print(GRN(f'  ✓ {msg}'))
         else:
